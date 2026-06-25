@@ -14,7 +14,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 ===================================================================
 --- /dev/null
 +++ code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipadKoreanImeBridge.ts
-@@ -0,0 +1,701 @@
+@@ -0,0 +1,700 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -85,10 +85,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +				return false;
 +			}
 +
-+			if (event.key === 'Enter' || event.key === 'Tab' || event.key === 'Escape') {
-+				this._flushJamoComposer();
-+				return undefined;
-+			}
++			return undefined;
 +		}
 +
 +		if (!this._isComposing && !this._isFinalizing) {
@@ -108,46 +105,49 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +		return undefined;
 +	}
 +
-+	shouldIgnoreXtermData(data: string): boolean {
++	handleXtermData(data: string): string | undefined {
 +		if (!data) {
-+			return false;
++			return data;
 +		}
 +
 +		this._pruneSentData();
 +
 +		if (this._consumeSentData(data)) {
-+			return true;
++			return undefined;
 +		}
 +
 +		if (isBackspace(data) && this._jamoComposer.hasPending()) {
 +			this._jamoComposer.backspace();
 +			this._markIgnoreWindow();
-+			return true;
++			return undefined;
 +		}
 +
 +		if (isKoreanInputText(data) && containsCompatibilityJamo(data)) {
 +			if (this._isComposing || this._isFinalizing) {
 +				this._rememberCompositionJamoText(data);
 +				this._markIgnoreWindow();
-+				return true;
++				return undefined;
 +			}
 +			if (this._consumeRecentBufferedJamo(data)) {
-+				return true;
++				return undefined;
 +			}
 +			this._bufferKoreanText(data, false);
-+			return true;
++			return undefined;
 +		}
 +
 +		const now = Date.now();
 +		if ((this._isComposing || this._isFinalizing || now < this._ignoreUntil) && containsHangul(data)) {
-+			return true;
++			return undefined;
 +		}
 +
 +		if (this._jamoComposer.hasPending()) {
-+			this._flushJamoComposer();
++			const committed = this._drainJamoComposer();
++			if (committed) {
++				return committed + data;
++			}
 +		}
 +
-+		return false;
++		return data;
 +	}
 +
 +	override dispose(): void {
@@ -327,13 +327,12 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +		this._compositionJamoText += data;
 +	}
 +
-+	private _flushJamoComposer(): void {
++	private _drainJamoComposer(): string {
 +		const committed = this._jamoComposer.flush();
 +		if (committed) {
-+			this._rememberSentData(committed);
 +			this._markIgnoreWindow();
-+			this._sendData(committed);
 +		}
++		return committed;
 +	}
 +
 +	private _rememberSentData(data: string): void {
@@ -736,17 +735,21 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ter
  	private readonly _scopedContextKeyService: IContextKeyService;
  	private _resizeDebouncer?: TerminalResizeDebouncer;
  
-@@ -873,6 +875,9 @@ export class TerminalInstance extends Di
+@@ -873,6 +875,13 @@ export class TerminalInstance extends Di
  
  		this._register(this._processManager.onProcessData(e => this._onProcessData(e)));
  		this._register(xterm.raw.onData(async data => {
-+			if (this._ipadKoreanImeBridge?.shouldIgnoreXtermData(data)) {
-+				return;
++			if (this._ipadKoreanImeBridge) {
++				const bridgedData = this._ipadKoreanImeBridge.handleXtermData(data);
++				if (bridgedData === undefined) {
++					return;
++				}
++				data = bridgedData;
 +			}
  			await this._handleOnData(data);
  		}));
  		this._register(xterm.raw.onBinary(data => this._processManager.processBinary(data)));
-@@ -1132,12 +1137,25 @@ export class TerminalInstance extends Di
+@@ -1132,12 +1141,25 @@ export class TerminalInstance extends Di
  
  		this._setAriaLabel(xterm.raw, this._instanceId, this._title);
  
