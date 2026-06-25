@@ -14,7 +14,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 ===================================================================
 --- /dev/null
 +++ code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipadKoreanImeBridge.ts
-@@ -0,0 +1,700 @@
+@@ -0,0 +1,862 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -29,7 +29,8 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +
 +const enum Constants {
 +	IgnoreWindow = 750,
-+	DuplicateWindow = 120
++	DuplicateWindow = 120,
++	MirrorDuplicateWindow = 35
 +}
 +
 +interface ISentData {
@@ -46,6 +47,8 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +const compatibilityJamoCharRegex = /[\u3131-\u3163]/;
 +const compatibilityJamoRegex = /^[\u3131-\u3163]+$/;
 +const koreanInputTextRegex = /^[\u3131-\u3163\uAC00-\uD7A3]+$/;
++const utf8Decoder = new TextDecoder();
++const utf8Encoder = new TextEncoder();
 +
 +/**
 + * iPadOS WebKit can deliver Korean IME composition through textarea mutations that xterm.js'
@@ -54,7 +57,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 + */
 +export class IpadKoreanImeBridge extends Disposable {
 +	static shouldEnable(mode: IpadKoreanImeMode): boolean {
-+		return mode === 'on' || (mode === 'auto' && isIOS && isWebKit);
++		return mode === 'on' || (mode === 'auto' && isIpadOSWebKit());
 +	}
 +
 +	private _isComposing = false;
@@ -65,13 +68,16 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +	private _compositionJamoText = '';
 +	private _ignoreUntil = 0;
 +	private _finalizeTimer: number | undefined;
++	private _previewTimer: number | undefined;
++	private _previewWidth = 0;
 +	private readonly _sentData: ISentData[] = [];
 +	private readonly _jamoComposer = new KoreanJamoComposer();
 +	private _recentBufferedJamo: IRecentBufferedJamo | undefined;
 +
 +	constructor(
 +		private readonly _textarea: HTMLTextAreaElement,
-+		private readonly _sendData: (data: string) => void
++		private readonly _sendData: (data: string) => void,
++		private readonly _writePreviewData: (data: string) => void
 +	) {
 +		super();
 +		this._registerListeners();
@@ -79,6 +85,17 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +
 +	handleKeyEvent(event: KeyboardEvent): boolean | undefined {
 +		if (this._jamoComposer.hasPending()) {
++			if (event.key === 'Enter') {
++				const committed = this._drainJamoComposer();
++				if (committed) {
++					const data = committed + '\r';
++					this._clearPreview();
++					this._rememberSentData(data);
++					this._sendData(data);
++					return false;
++				}
++			}
++
 +			if (event.key === 'Backspace') {
 +				this._jamoComposer.backspace();
 +				this._markIgnoreWindow();
@@ -116,9 +133,30 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +			return undefined;
 +		}
 +
++		const keyboardProtocolData = decodeKeyboardProtocolData(data);
++		if (keyboardProtocolData !== undefined) {
++			if (isKoreanInputText(keyboardProtocolData)) {
++				if (this._isComposing || this._isFinalizing) {
++					this._rememberCompositionJamoText(keyboardProtocolData);
++					this._markIgnoreWindow();
++					return undefined;
++				}
++				if (this._consumeRecentBufferedJamo(keyboardProtocolData)) {
++					return undefined;
++				}
++				this._bufferKoreanText(keyboardProtocolData, true, Constants.MirrorDuplicateWindow);
++				return undefined;
++			}
++
++			if (this._jamoComposer.hasPending()) {
++				return this.handleXtermData(keyboardProtocolData);
++			}
++		}
++
 +		if (isBackspace(data) && this._jamoComposer.hasPending()) {
 +			this._jamoComposer.backspace();
 +			this._markIgnoreWindow();
++			this._schedulePreviewUpdate();
 +			return undefined;
 +		}
 +
@@ -131,7 +169,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +			if (this._consumeRecentBufferedJamo(data)) {
 +				return undefined;
 +			}
-+			this._bufferKoreanText(data, false);
++			this._bufferKoreanText(data, true, Constants.MirrorDuplicateWindow);
 +			return undefined;
 +		}
 +
@@ -143,6 +181,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +		if (this._jamoComposer.hasPending()) {
 +			const committed = this._drainJamoComposer();
 +			if (committed) {
++				this._clearPreview();
 +				return committed + data;
 +			}
 +		}
@@ -150,12 +189,46 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +		return data;
 +	}
 +
++	handleXtermBinary(data: string): string | undefined {
++		if (!data) {
++			return data;
++		}
++
++		const decodedData = decodeBinaryData(data);
++		const keyboardProtocolData = decodeKeyboardProtocolData(decodedData);
++		if (!this._jamoComposer.hasPending() && !containsHangul(decodedData) && !containsHangul(keyboardProtocolData ?? '')) {
++			return data;
++		}
++
++		const bridgedData = this.handleXtermData(decodedData);
++		if (bridgedData === undefined) {
++			return undefined;
++		}
++		if (bridgedData === decodedData) {
++			return data;
++		}
++		return encodeBinaryData(bridgedData);
++	}
++
 +	override dispose(): void {
 +		if (this._finalizeTimer !== undefined) {
 +			dom.getWindow(this._textarea).clearTimeout(this._finalizeTimer);
 +			this._finalizeTimer = undefined;
 +		}
++		if (this._previewTimer !== undefined) {
++			dom.getWindow(this._textarea).clearTimeout(this._previewTimer);
++			this._previewTimer = undefined;
++		}
++		this._clearPreview();
 +		super.dispose();
++	}
++
++	willWriteProcessData(): void {
++		this._clearPreview();
++	}
++
++	didWriteProcessData(): void {
++		this._schedulePreviewUpdate();
 +	}
 +
 +	private _registerListeners(): void {
@@ -299,18 +372,23 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +		this._ignoreUntil = Date.now() + Constants.IgnoreWindow;
 +	}
 +
-+	private _bufferKoreanText(data: string, rememberRecentBufferedJamo: boolean): void {
++	private _bufferKoreanText(data: string, rememberRecentBufferedJamo: boolean, duplicateWindow = Constants.DuplicateWindow): void {
 +		const committed = this._jamoComposer.inputKoreanText(data);
 +
 +		if (rememberRecentBufferedJamo) {
-+			this._rememberRecentBufferedJamo(data);
++			this._rememberRecentBufferedJamo(data, duplicateWindow);
 +		}
 +		this._markIgnoreWindow();
 +
 +		if (committed) {
++			this._clearPreview();
 +			this._rememberSentData(committed);
 +			this._sendData(committed);
++			this._schedulePreviewUpdate();
++			return;
 +		}
++
++		this._updatePreview();
 +	}
 +
 +	private _rememberCompositionJamoText(data: string): void {
@@ -333,6 +411,38 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +			this._markIgnoreWindow();
 +		}
 +		return committed;
++	}
++
++	private _schedulePreviewUpdate(): void {
++		if (this._previewTimer !== undefined) {
++			dom.getWindow(this._textarea).clearTimeout(this._previewTimer);
++		}
++		this._previewTimer = dom.getWindow(this._textarea).setTimeout(() => {
++			this._previewTimer = undefined;
++			this._updatePreview();
++		}, 30);
++	}
++
++	private _updatePreview(): void {
++		this._clearPreview();
++		const previewText = this._jamoComposer.preview();
++		if (!previewText) {
++			return;
++		}
++		this._previewWidth = getTerminalCellWidth(previewText);
++		this._writePreviewData(`\x1b[s${previewText}\x1b[u`);
++	}
++
++	private _clearPreview(): void {
++		if (this._previewTimer !== undefined) {
++			dom.getWindow(this._textarea).clearTimeout(this._previewTimer);
++			this._previewTimer = undefined;
++		}
++		if (!this._previewWidth) {
++			return;
++		}
++		this._writePreviewData(`\x1b[s${' '.repeat(this._previewWidth)}\x1b[u`);
++		this._previewWidth = 0;
 +	}
 +
 +	private _rememberSentData(data: string): void {
@@ -361,8 +471,8 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +		}
 +	}
 +
-+	private _rememberRecentBufferedJamo(data: string): void {
-+		this._recentBufferedJamo = { data, expiresAt: Date.now() + Constants.DuplicateWindow };
++	private _rememberRecentBufferedJamo(data: string, duplicateWindow = Constants.DuplicateWindow): void {
++		this._recentBufferedJamo = { data, expiresAt: Date.now() + duplicateWindow };
 +	}
 +
 +	private _consumeRecentBufferedJamo(data: string): boolean {
@@ -377,6 +487,14 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +
 +function containsHangul(value: string): boolean {
 +	return hangulRegex.test(value);
++}
++
++function isIpadOSWebKit(): boolean {
++	return isWebKit && (isIOS || isIpadOSDesktopMode());
++}
++
++function isIpadOSDesktopMode(): boolean {
++	return navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1;
 +}
 +
 +function containsPrecomposedHangul(value: string): boolean {
@@ -397,6 +515,46 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +
 +function isBackspace(value: string): boolean {
 +	return value === '\x7f' || value === '\b';
++}
++
++function getTerminalCellWidth(value: string): number {
++	let width = 0;
++	for (const char of value) {
++		width += containsHangul(char) ? 2 : 1;
++	}
++	return width;
++}
++
++function decodeBinaryData(value: string): string {
++	const bytes = Uint8Array.from(value, char => char.charCodeAt(0));
++	return utf8Decoder.decode(bytes);
++}
++
++function encodeBinaryData(value: string): string {
++	let result = '';
++	for (const byte of utf8Encoder.encode(value)) {
++		result += String.fromCharCode(byte);
++	}
++	return result;
++}
++
++function decodeKeyboardProtocolData(value: string): string | undefined {
++	const regex = /\x1b\[(\d+)(?:;[\d:]+)?u/g;
++	let result = '';
++	let index = 0;
++	let match: RegExpExecArray | null;
++	while ((match = regex.exec(value)) !== null) {
++		if (match.index !== index) {
++			return undefined;
++		}
++		const codePoint = Number(match[1]);
++		if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10FFFF) {
++			return undefined;
++		}
++		result += String.fromCodePoint(codePoint);
++		index = regex.lastIndex;
++	}
++	return result && index === value.length ? result : undefined;
 +}
 +
 +function getInsertedText(before: string, after: string): string {
@@ -503,6 +661,10 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +		const committed = this._composePending();
 +		this.clear();
 +		return committed;
++	}
++
++	preview(): string {
++		return this._composePending();
 +	}
 +
 +	private clear(): void {
@@ -735,7 +897,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ter
  	private readonly _scopedContextKeyService: IContextKeyService;
  	private _resizeDebouncer?: TerminalResizeDebouncer;
  
-@@ -873,6 +875,13 @@ export class TerminalInstance extends Di
+@@ -873,9 +875,25 @@ export class TerminalInstance extends Di
  
  		this._register(this._processManager.onProcessData(e => this._onProcessData(e)));
  		this._register(xterm.raw.onData(async data => {
@@ -748,8 +910,21 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ter
 +			}
  			await this._handleOnData(data);
  		}));
- 		this._register(xterm.raw.onBinary(data => this._processManager.processBinary(data)));
-@@ -1132,12 +1141,25 @@ export class TerminalInstance extends Di
+-		this._register(xterm.raw.onBinary(data => this._processManager.processBinary(data)));
++		this._register(xterm.raw.onBinary(data => {
++			if (this._ipadKoreanImeBridge) {
++				const bridgedData = this._ipadKoreanImeBridge.handleXtermBinary(data);
++				if (bridgedData === undefined) {
++					return;
++				}
++				data = bridgedData;
++			}
++			this._processManager.processBinary(data);
++		}));
+ 		// Init conpty compat and link handler after process creation as they rely on the
+ 		// underlying process OS
+ 		this._register(this._processManager.onProcessReady(async (processTraits) => {
+@@ -1132,12 +1150,27 @@ export class TerminalInstance extends Di
  
  		this._setAriaLabel(xterm.raw, this._instanceId, this._title);
  
@@ -757,6 +932,8 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ter
 +		if (IpadKoreanImeBridge.shouldEnable(ipadKoreanImeMode)) {
 +			this._ipadKoreanImeBridge = this._register(new IpadKoreanImeBridge(xterm.raw.textarea, data => {
 +				void this._handleOnData(data);
++			}, data => {
++				xterm.raw.write(data);
 +			}));
 +		}
 +
@@ -774,6 +951,20 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ter
 +
  			const standardKeyboardEvent = new StandardKeyboardEvent(event);
  			const resolveResult = this._keybindingService.softDispatch(standardKeyboardEvent, standardKeyboardEvent.target);
+ 
+@@ -1679,11 +1712,13 @@ export class TerminalInstance extends Di
+ 	private _writeProcessData(data: string, cb?: () => void) {
+ 		this._onWillData.fire(data);
+ 		const messageId = ++this._latestXtermWriteData;
++		this._ipadKoreanImeBridge?.willWriteProcessData();
+ 		this.xterm?.raw.write(data, () => {
+ 			this._latestXtermParseData = messageId;
+ 			this._processManager.acknowledgeDataEvent(data.length);
+ 			cb?.();
+ 			this._onData.fire(data);
++			this._ipadKoreanImeBridge?.didWriteProcessData();
+ 		});
+ 	}
  
 Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/common/terminalConfiguration.ts
 ===================================================================
