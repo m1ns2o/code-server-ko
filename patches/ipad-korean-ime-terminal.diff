@@ -14,7 +14,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 ===================================================================
 --- /dev/null
 +++ code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipadKoreanImeBridge.ts
-@@ -0,0 +1,862 @@
+@@ -0,0 +1,892 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -30,7 +30,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +const enum Constants {
 +	IgnoreWindow = 750,
 +	DuplicateWindow = 120,
-+	MirrorDuplicateWindow = 35
++	MirrorDuplicateWindow = 180
 +}
 +
 +interface ISentData {
@@ -40,8 +40,11 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +
 +interface IRecentBufferedJamo {
 +	readonly data: string;
++	readonly source: KoreanInputSource;
 +	readonly expiresAt: number;
 +}
++
++type KoreanInputSource = 'text' | 'binary' | 'textKeyboardProtocol' | 'binaryKeyboardProtocol' | 'composition';
 +
 +const hangulRegex = /[\u1100-\u11FF\u3130-\u318F\uA960-\uA97F\uAC00-\uD7AF\uD7B0-\uD7FF]/;
 +const compatibilityJamoCharRegex = /[\u3131-\u3163]/;
@@ -72,7 +75,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +	private _previewWidth = 0;
 +	private readonly _sentData: ISentData[] = [];
 +	private readonly _jamoComposer = new KoreanJamoComposer();
-+	private _recentBufferedJamo: IRecentBufferedJamo | undefined;
++	private readonly _recentBufferedJamo: IRecentBufferedJamo[] = [];
 +
 +	constructor(
 +		private readonly _textarea: HTMLTextAreaElement,
@@ -123,6 +126,10 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +	}
 +
 +	handleXtermData(data: string): string | undefined {
++		return this._handleXtermData(data, 'text');
++	}
++
++	private _handleXtermData(data: string, source: KoreanInputSource): string | undefined {
 +		if (!data) {
 +			return data;
 +		}
@@ -135,21 +142,22 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +
 +		const keyboardProtocolData = decodeKeyboardProtocolData(data);
 +		if (keyboardProtocolData !== undefined) {
++			const keyboardProtocolSource = getKeyboardProtocolSource(source);
 +			if (isKoreanInputText(keyboardProtocolData)) {
 +				if (this._isComposing || this._isFinalizing) {
 +					this._rememberCompositionJamoText(keyboardProtocolData);
 +					this._markIgnoreWindow();
 +					return undefined;
 +				}
-+				if (this._consumeRecentBufferedJamo(keyboardProtocolData)) {
++				if (this._consumeRecentBufferedJamo(keyboardProtocolData, keyboardProtocolSource)) {
 +					return undefined;
 +				}
-+				this._bufferKoreanText(keyboardProtocolData, true, Constants.MirrorDuplicateWindow);
++				this._bufferKoreanText(keyboardProtocolData, true, keyboardProtocolSource, Constants.MirrorDuplicateWindow);
 +				return undefined;
 +			}
 +
 +			if (this._jamoComposer.hasPending()) {
-+				return this.handleXtermData(keyboardProtocolData);
++				return this._handleXtermData(keyboardProtocolData, keyboardProtocolSource);
 +			}
 +		}
 +
@@ -166,10 +174,10 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +				this._markIgnoreWindow();
 +				return undefined;
 +			}
-+			if (this._consumeRecentBufferedJamo(data)) {
++			if (this._consumeRecentBufferedJamo(data, source)) {
 +				return undefined;
 +			}
-+			this._bufferKoreanText(data, true, Constants.MirrorDuplicateWindow);
++			this._bufferKoreanText(data, true, source, Constants.MirrorDuplicateWindow);
 +			return undefined;
 +		}
 +
@@ -200,7 +208,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +			return data;
 +		}
 +
-+		const bridgedData = this.handleXtermData(decodedData);
++		const bridgedData = this._handleXtermData(decodedData, 'binary');
 +		if (bridgedData === undefined) {
 +			return undefined;
 +		}
@@ -331,7 +339,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +		}
 +
 +		if (isKoreanInputText(data)) {
-+			this._bufferKoreanText(data, true);
++			this._bufferKoreanText(data, true, 'composition');
 +			return;
 +		}
 +
@@ -341,20 +349,25 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +	}
 +
 +	private _resolveFinalData(fallback: string): string {
++		const insertedText = getInsertedText(this._compositionStartValue, this._textarea.value);
++		const jamoCandidates = [this._compositionJamoText, this._lastCompositionData, this._lastInputData, fallback, insertedText]
++			.filter(isKoreanJamoText)
++			.sort((a, b) => b.length - a.length);
++		const vowelOnlyJamo = jamoCandidates.find(isVowelOnlyJamoText);
++		if (vowelOnlyJamo) {
++			return vowelOnlyJamo;
++		}
++
 +		for (const value of [this._lastCompositionData, this._lastInputData, fallback]) {
 +			if (containsPrecomposedHangul(value)) {
 +				return value;
 +			}
 +		}
 +
-+		const insertedText = getInsertedText(this._compositionStartValue, this._textarea.value);
 +		if (containsPrecomposedHangul(insertedText)) {
 +			return insertedText;
 +		}
 +
-+		const jamoCandidates = [this._compositionJamoText, this._lastCompositionData, this._lastInputData, fallback, insertedText]
-+			.filter(isKoreanJamoText)
-+			.sort((a, b) => b.length - a.length);
 +		if (jamoCandidates.length) {
 +			return jamoCandidates[0];
 +		}
@@ -372,11 +385,11 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +		this._ignoreUntil = Date.now() + Constants.IgnoreWindow;
 +	}
 +
-+	private _bufferKoreanText(data: string, rememberRecentBufferedJamo: boolean, duplicateWindow = Constants.DuplicateWindow): void {
++	private _bufferKoreanText(data: string, rememberRecentBufferedJamo: boolean, source: KoreanInputSource, duplicateWindow = Constants.DuplicateWindow): void {
 +		const committed = this._jamoComposer.inputKoreanText(data);
 +
 +		if (rememberRecentBufferedJamo) {
-+			this._rememberRecentBufferedJamo(data, duplicateWindow);
++			this._rememberRecentBufferedJamo(data, source, duplicateWindow);
 +		}
 +		this._markIgnoreWindow();
 +
@@ -466,22 +479,21 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +				this._sentData.splice(i, 1);
 +			}
 +		}
-+		if (this._recentBufferedJamo && this._recentBufferedJamo.expiresAt < now) {
-+			this._recentBufferedJamo = undefined;
++		for (let i = this._recentBufferedJamo.length - 1; i >= 0; i--) {
++			if (this._recentBufferedJamo[i].expiresAt < now) {
++				this._recentBufferedJamo.splice(i, 1);
++			}
 +		}
 +	}
 +
-+	private _rememberRecentBufferedJamo(data: string, duplicateWindow = Constants.DuplicateWindow): void {
-+		this._recentBufferedJamo = { data, expiresAt: Date.now() + duplicateWindow };
-+	}
-+
-+	private _consumeRecentBufferedJamo(data: string): boolean {
++	private _rememberRecentBufferedJamo(data: string, source: KoreanInputSource, duplicateWindow = Constants.DuplicateWindow): void {
++		this._recentBufferedJamo.push({ data, source, expiresAt: Date.now() + duplicateWindow });
 +		this._pruneSentData();
-+		if (this._recentBufferedJamo?.data !== data) {
-+			return false;
-+		}
-+		this._recentBufferedJamo = undefined;
-+		return true;
++	}
++
++	private _consumeRecentBufferedJamo(data: string, source: KoreanInputSource): boolean {
++		this._pruneSentData();
++		return this._recentBufferedJamo.some(entry => entry.data === data && entry.source !== source);
 +	}
 +}
 +
@@ -505,6 +517,10 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +	return compatibilityJamoRegex.test(value);
 +}
 +
++function isVowelOnlyJamoText(value: string): boolean {
++	return !!value && [...value].every(isMedial);
++}
++
 +function containsCompatibilityJamo(value: string): boolean {
 +	return compatibilityJamoCharRegex.test(value);
 +}
@@ -515,6 +531,10 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +
 +function isBackspace(value: string): boolean {
 +	return value === '\x7f' || value === '\b';
++}
++
++function getKeyboardProtocolSource(source: KoreanInputSource): KoreanInputSource {
++	return source === 'binary' || source === 'binaryKeyboardProtocol' ? 'binaryKeyboardProtocol' : 'textKeyboardProtocol';
 +}
 +
 +function getTerminalCellWidth(value: string): number {
@@ -722,7 +742,11 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +
 +	private _inputMedial(char: string): string {
 +		if (!this._leading) {
-+			this._leading = 'ㅇ';
++			if (this._medial) {
++				const committed = this._medial;
++				this._medial = char;
++				return committed;
++			}
 +			this._medial = char;
 +			return '';
 +		}
@@ -740,7 +764,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +			}
 +
 +			const committed = this._composePending();
-+			this._leading = 'ㅇ';
++			this._leading = '';
 +			this._medial = char;
 +			this._trailing = '';
 +			return committed;
@@ -765,6 +789,12 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +
 +	private _inputConsonant(char: string): string {
 +		if (!this._leading) {
++			if (this._medial) {
++				const committed = this._medial;
++				this._medial = '';
++				this._leading = char;
++				return committed;
++			}
 +			this._leading = char;
 +			return '';
 +		}
