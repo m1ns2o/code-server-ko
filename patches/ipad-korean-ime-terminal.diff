@@ -14,7 +14,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 ===================================================================
 --- /dev/null
 +++ code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipadKoreanImeBridge.ts
-@@ -0,0 +1,534 @@
+@@ -0,0 +1,701 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -28,7 +28,8 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +export type IpadKoreanImeMode = 'auto' | 'on' | 'off';
 +
 +const enum Constants {
-+	IgnoreWindow = 750
++	IgnoreWindow = 750,
++	DuplicateWindow = 120
 +}
 +
 +interface ISentData {
@@ -42,7 +43,9 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +}
 +
 +const hangulRegex = /[\u1100-\u11FF\u3130-\u318F\uA960-\uA97F\uAC00-\uD7AF\uD7B0-\uD7FF]/;
++const compatibilityJamoCharRegex = /[\u3131-\u3163]/;
 +const compatibilityJamoRegex = /^[\u3131-\u3163]+$/;
++const koreanInputTextRegex = /^[\u3131-\u3163\uAC00-\uD7A3]+$/;
 +
 +/**
 + * iPadOS WebKit can deliver Korean IME composition through textarea mutations that xterm.js'
@@ -59,6 +62,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +	private _compositionStartValue = '';
 +	private _lastCompositionData = '';
 +	private _lastInputData = '';
++	private _compositionJamoText = '';
 +	private _ignoreUntil = 0;
 +	private _finalizeTimer: number | undefined;
 +	private readonly _sentData: ISentData[] = [];
@@ -121,21 +125,26 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +			return true;
 +		}
 +
-+		if (isKoreanJamoText(data)) {
++		if (isKoreanInputText(data) && containsCompatibilityJamo(data)) {
++			if (this._isComposing || this._isFinalizing) {
++				this._rememberCompositionJamoText(data);
++				this._markIgnoreWindow();
++				return true;
++			}
 +			if (this._consumeRecentBufferedJamo(data)) {
 +				return true;
 +			}
-+			this._bufferJamoText(data);
++			this._bufferKoreanText(data, false);
 +			return true;
-+		}
-+
-+		if (this._jamoComposer.hasPending()) {
-+			this._flushJamoComposer();
 +		}
 +
 +		const now = Date.now();
 +		if ((this._isComposing || this._isFinalizing || now < this._ignoreUntil) && containsHangul(data)) {
 +			return true;
++		}
++
++		if (this._jamoComposer.hasPending()) {
++			this._flushJamoComposer();
 +		}
 +
 +		return false;
@@ -163,12 +172,16 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +		this._compositionStartValue = this._textarea.value;
 +		this._lastCompositionData = '';
 +		this._lastInputData = '';
++		this._compositionJamoText = '';
 +		this._markIgnoreWindow();
 +	}
 +
 +	private _handleCompositionUpdate(event: CompositionEvent): void {
 +		if (containsHangul(event.data)) {
 +			this._lastCompositionData = event.data;
++			if (isKoreanJamoText(event.data)) {
++				this._rememberCompositionJamoText(event.data);
++			}
 +			this._markIgnoreWindow();
 +		}
 +	}
@@ -176,6 +189,9 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +	private _handleCompositionEnd(event: CompositionEvent): void {
 +		if (containsHangul(event.data)) {
 +			this._lastCompositionData = event.data;
++			if (isKoreanJamoText(event.data)) {
++				this._rememberCompositionJamoText(event.data);
++			}
 +		}
 +		this._isComposing = false;
 +		this._isFinalizing = true;
@@ -188,6 +204,9 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +			if (containsHangul(event.data ?? '')) {
 +				this._lastInputData = event.data ?? '';
 +			}
++			if (isKoreanJamoText(event.data ?? '')) {
++				this._rememberCompositionJamoText(event.data ?? '');
++			}
 +			this._markIgnoreWindow();
 +		}
 +	}
@@ -197,6 +216,9 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +			const data = event.data ?? '';
 +			if (containsHangul(data)) {
 +				this._lastInputData = data;
++				if (isKoreanJamoText(data)) {
++					this._rememberCompositionJamoText(data);
++				}
 +			}
 +			this._markIgnoreWindow();
 +			return;
@@ -204,6 +226,9 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +
 +		if ((this._isComposing || this._isFinalizing) && containsHangul(event.data ?? '')) {
 +			this._lastInputData = event.data ?? '';
++			if (isKoreanJamoText(event.data ?? '')) {
++				this._rememberCompositionJamoText(event.data ?? '');
++			}
 +			this._scheduleFinalize(event.data ?? '');
 +		}
 +	}
@@ -225,14 +250,15 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +		this._isFinalizing = false;
 +		this._lastCompositionData = '';
 +		this._lastInputData = '';
++		this._compositionJamoText = '';
 +		this._compositionStartValue = this._textarea.value;
 +
 +		if (!data || !containsHangul(data)) {
 +			return;
 +		}
 +
-+		if (isKoreanJamoText(data)) {
-+			this._bufferJamoText(data);
++		if (isKoreanInputText(data)) {
++			this._bufferKoreanText(data, true);
 +			return;
 +		}
 +
@@ -242,37 +268,63 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +	}
 +
 +	private _resolveFinalData(fallback: string): string {
-+		if (containsHangul(this._lastCompositionData)) {
-+			return this._lastCompositionData;
-+		}
-+		if (containsHangul(this._lastInputData)) {
-+			return this._lastInputData;
-+		}
-+		if (containsHangul(fallback)) {
-+			return fallback;
++		for (const value of [this._lastCompositionData, this._lastInputData, fallback]) {
++			if (containsPrecomposedHangul(value)) {
++				return value;
++			}
 +		}
 +
 +		const insertedText = getInsertedText(this._compositionStartValue, this._textarea.value);
-+		return containsHangul(insertedText) ? insertedText : '';
++		if (containsPrecomposedHangul(insertedText)) {
++			return insertedText;
++		}
++
++		const jamoCandidates = [this._compositionJamoText, this._lastCompositionData, this._lastInputData, fallback, insertedText]
++			.filter(isKoreanJamoText)
++			.sort((a, b) => b.length - a.length);
++		if (jamoCandidates.length) {
++			return jamoCandidates[0];
++		}
++
++		for (const value of [this._lastCompositionData, this._lastInputData, fallback, insertedText]) {
++			if (containsHangul(value)) {
++				return value;
++			}
++		}
++
++		return '';
 +	}
 +
 +	private _markIgnoreWindow(): void {
 +		this._ignoreUntil = Date.now() + Constants.IgnoreWindow;
 +	}
 +
-+	private _bufferJamoText(data: string): void {
-+		let committed = '';
-+		for (const char of data) {
-+			committed += this._jamoComposer.input(char);
-+		}
++	private _bufferKoreanText(data: string, rememberRecentBufferedJamo: boolean): void {
++		const committed = this._jamoComposer.inputKoreanText(data);
 +
-+		this._rememberRecentBufferedJamo(data);
++		if (rememberRecentBufferedJamo) {
++			this._rememberRecentBufferedJamo(data);
++		}
 +		this._markIgnoreWindow();
 +
 +		if (committed) {
 +			this._rememberSentData(committed);
 +			this._sendData(committed);
 +		}
++	}
++
++	private _rememberCompositionJamoText(data: string): void {
++		if (!data) {
++			return;
++		}
++		if (!this._compositionJamoText || data.startsWith(this._compositionJamoText)) {
++			this._compositionJamoText = data;
++			return;
++		}
++		if (this._compositionJamoText.endsWith(data)) {
++			return;
++		}
++		this._compositionJamoText += data;
 +	}
 +
 +	private _flushJamoComposer(): void {
@@ -285,12 +337,12 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +	}
 +
 +	private _rememberSentData(data: string): void {
-+		this._sentData.push({ data, expiresAt: Date.now() + Constants.IgnoreWindow });
++		this._sentData.push({ data, expiresAt: Date.now() + Constants.DuplicateWindow });
 +		this._pruneSentData();
 +	}
 +
 +	private _consumeSentData(data: string): boolean {
-+		const index = this._sentData.findIndex(entry => entry.data === data || data.includes(entry.data));
++		const index = this._sentData.findIndex(entry => entry.data === data);
 +		if (index === -1) {
 +			return false;
 +		}
@@ -311,7 +363,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +	}
 +
 +	private _rememberRecentBufferedJamo(data: string): void {
-+		this._recentBufferedJamo = { data, expiresAt: Date.now() + Constants.IgnoreWindow };
++		this._recentBufferedJamo = { data, expiresAt: Date.now() + Constants.DuplicateWindow };
 +	}
 +
 +	private _consumeRecentBufferedJamo(data: string): boolean {
@@ -328,8 +380,20 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +	return hangulRegex.test(value);
 +}
 +
++function containsPrecomposedHangul(value: string): boolean {
++	return /[\uAC00-\uD7AF]/.test(value);
++}
++
 +function isKoreanJamoText(value: string): boolean {
 +	return compatibilityJamoRegex.test(value);
++}
++
++function containsCompatibilityJamo(value: string): boolean {
++	return compatibilityJamoCharRegex.test(value);
++}
++
++function isKoreanInputText(value: string): boolean {
++	return koreanInputTextRegex.test(value);
 +}
 +
 +function isBackspace(value: string): boolean {
@@ -362,6 +426,12 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +	['ㅡㅣ', 'ㅢ']
 +]);
 +
++const splitCompoundMedials = new Map<string, string[]>([
++	['ㅘ', ['ㅗ', 'ㅏ']], ['ㅙ', ['ㅗ', 'ㅐ']], ['ㅚ', ['ㅗ', 'ㅣ']],
++	['ㅝ', ['ㅜ', 'ㅓ']], ['ㅞ', ['ㅜ', 'ㅔ']], ['ㅟ', ['ㅜ', 'ㅣ']],
++	['ㅢ', ['ㅡ', 'ㅣ']]
++]);
++
 +const compoundTrails = new Map<string, string>([
 +	['ㄱㅅ', 'ㄳ'], ['ㄴㅈ', 'ㄵ'], ['ㄴㅎ', 'ㄶ'],
 +	['ㄹㄱ', 'ㄺ'], ['ㄹㅁ', 'ㄻ'], ['ㄹㅂ', 'ㄼ'], ['ㄹㅅ', 'ㄽ'], ['ㄹㅌ', 'ㄾ'], ['ㄹㅍ', 'ㄿ'], ['ㄹㅎ', 'ㅀ'],
@@ -374,7 +444,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +	['ㅄ', ['ㅂ', 'ㅅ']]
 +]);
 +
-+class KoreanJamoComposer {
++export class KoreanJamoComposer {
 +	private _leading = '';
 +	private _medial = '';
 +	private _trailing = '';
@@ -382,6 +452,25 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +
 +	hasPending(): boolean {
 +		return !!(this._leading || this._medial || this._trailing);
++	}
++
++	inputKoreanText(value: string): string {
++		let committed = '';
++		for (const char of value) {
++			if (isKoreanJamoText(char)) {
++				committed += this.input(char);
++				continue;
++			}
++
++			const jamo = decomposeHangulSyllable(char);
++			if (jamo) {
++				committed += this._inputSyllableJamo(jamo);
++				continue;
++			}
++
++			committed += this.flush() + char;
++		}
++		return committed;
 +	}
 +
 +	input(char: string): string {
@@ -392,6 +481,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +		this._history.push(char);
 +		const committed = this._inputCore(char);
 +		this._normalizeDanglingVowel();
++		this._syncHistoryToPending();
 +		return committed;
 +	}
 +
@@ -421,6 +511,42 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +		this._medial = '';
 +		this._trailing = '';
 +		this._history.length = 0;
++	}
++
++	private _inputSyllableJamo(jamo: string[]): string {
++		const pending = this._getPendingJamo();
++		let input = jamo;
++
++		if (pending.length > 0 && startsWithJamo(jamo, pending)) {
++			input = jamo.slice(pending.length);
++		} else if (pending.length > 0 && jamo[0] === 'ㅇ' && jamo.length > 1 && isMedial(jamo[1])) {
++			input = jamo.slice(1);
++		}
++
++		let committed = '';
++		for (const char of input) {
++			committed += this.input(char);
++		}
++		return committed;
++	}
++
++	private _syncHistoryToPending(): void {
++		this._history.length = 0;
++		this._history.push(...this._getPendingJamo());
++	}
++
++	private _getPendingJamo(): string[] {
++		const result: string[] = [];
++		if (this._leading) {
++			result.push(this._leading);
++		}
++		if (this._medial) {
++			result.push(...expandMedial(this._medial));
++		}
++		if (this._trailing) {
++			result.push(...expandTrailing(this._trailing));
++		}
++		return result;
 +	}
 +
 +	private _inputCore(char: string): string {
@@ -548,6 +674,47 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +		return leading + medial + trailing;
 +	}
 +	return String.fromCharCode(0xAC00 + ((leadingIndex * 21) + medialIndex) * 28 + trailingIndex);
++}
++
++function decomposeHangulSyllable(char: string): string[] | undefined {
++	const codePoint = char.charCodeAt(0);
++	if (codePoint < 0xAC00 || codePoint > 0xD7A3) {
++		return undefined;
++	}
++
++	const syllableIndex = codePoint - 0xAC00;
++	const trailingIndex = syllableIndex % 28;
++	const medialIndex = Math.floor(syllableIndex / 28) % 21;
++	const leadingIndex = Math.floor(syllableIndex / 28 / 21);
++	const trailing = trailingConsonants[trailingIndex];
++	return [
++		leadingConsonants[leadingIndex],
++		...expandMedial(medialVowels[medialIndex]),
++		...expandTrailing(trailing)
++	];
++}
++
++function expandMedial(medial: string): string[] {
++	return splitCompoundMedials.get(medial) ?? [medial];
++}
++
++function expandTrailing(trailing: string): string[] {
++	if (!trailing) {
++		return [];
++	}
++	return splitCompoundTrail.get(trailing) ?? [trailing];
++}
++
++function startsWithJamo(value: string[], prefix: string[]): boolean {
++	if (prefix.length > value.length) {
++		return false;
++	}
++	for (let i = 0; i < prefix.length; i++) {
++		if (value[i] !== prefix[i]) {
++			return false;
++		}
++	}
++	return true;
 +}
 Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
 ===================================================================

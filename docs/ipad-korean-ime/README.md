@@ -100,6 +100,10 @@ lib/vscode/src/vs/workbench/contrib/terminal/common/
 - iPad Pro 13-inch Simulator Safari:
   - `ㄱㅏㄴㅏㄷㅏ` raw 자모 입력이 `가나다`로 shell에 전달됨
   - `ㅎㅏㄴㄱㅡㄹ test 123 ㄱㅏㅂㅅ ㄱㅗㅐㄴㅊㅏㄴㅎㄷㅏ` raw 자모/ASCII 혼합 입력이 `한글 test 123 값 괜찮다`로 shell에 전달됨
+  - `ㄴ`과 `ㅏ` 사이를 약 1.8초 지연해도 `나`로 전달됨
+  - `값싼닭갈비가나다라`를 자모 단위 key action으로 입력해도 같은 문자열로 전달됨
+  - raw-mode TUI stdin reader에서도 `값싼닭갈비가나다라`가 같은 문자열로 전달됨
+  - partial composition 최종값이 `ㅏ`만 제공되고 이전 partial 이벤트가 `ㄴ`인 경우에도 `아`가 아니라 `나`로 전달됨
 
 Simulator 결과는 smoke/regression 증거입니다. 최종 acceptance는 실제 iPadOS Safari/Chrome의 software keyboard와 hardware keyboard에서 확인합니다.
 
@@ -129,5 +133,6 @@ npm run watch -- --bind-addr=0.0.0.0:18080 --auth=none --disable-workspace-trust
 
 - 한글 조합기는 compatibility jamo 범위 `U+3131..U+3163`만 처리합니다.
 - 완성형 한글이 composition event로 정상 전달되는 경우에는 그대로 전달합니다.
+- 같은 자모가 실제로 반복 입력되는 `닭갈` 같은 케이스를 보존하기 위해 raw 자모 입력은 최근 duplicate cache에 넣지 않습니다.
 - 후보 선택, 일본어/중국어 변환, punctuation 변환 보정은 의도적으로 구현하지 않았습니다.
 - bridge 실패 시 다음 대안은 xterm.js 교체가 아니라 `ghostty-web` API 호환성 검토입니다.
