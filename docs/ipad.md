@@ -102,6 +102,9 @@ and tricks helpful:
 
 ## Known issues
 
+- This fork includes an iPadOS WebKit workaround for Korean IME input in the
+  integrated terminal. See
+  [iPad Korean IME terminal support](./ipad-korean-ime/README.md).
 - Getting self-signed certificates to work [is an involved
   process](#access-code-server-with-a-self-signed-certificate-on-an-ipad)
 - Keyboard issues:
