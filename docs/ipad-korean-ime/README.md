@@ -35,6 +35,7 @@ code-server는 VS Code 소스를 `lib/vscode` submodule로 가져오고 `patches
 - Enter, Tab, Escape, 공백, ASCII 입력 전에 pending 한글 조합을 flush합니다.
 - Enter 같은 boundary key는 pending 한글과 같은 write로 묶어 보냅니다. 이렇게 해야 raw-mode TUI가 Enter를 먼저 처리해 마지막 글자를 잃는 일을 막을 수 있습니다.
 - iPadOS/WebKit이 pending 조합 상태에서 Enter를 xterm `onData`로 넘기지 않는 경우를 대비해 Enter keydown에서도 pending 한글과 `\r`을 한 번에 보냅니다.
+- Backspace가 key event와 raw data로 동시에 되비치는 경우에는 짧은 duplicate window에서 한 번만 처리합니다.
 
 ## Setting
 
@@ -117,6 +118,7 @@ lib/vscode/src/vs/workbench/contrib/terminal/common/
   - 초성 없는 `ㅓㅗㅏ` 입력은 `어오아`가 아니라 `ㅓㅗㅏ`로 전달됨
   - raw-mode TUI에서 Backspace가 조합 중/조합 완료 후 각각 자연스럽게 동작함
   - Enter submit 직전 pending 글자가 `각각가`, `괜찮다`, `읽다`, `앉다`에서 누락되지 않음
+  - 최종 통합 smoke에서 `한글`, `안녕하세요`, `값 괜찮다 읽다 앉다`, `한글 test 123 값`, `ㅓㅗㅏ ㅏㅣㅜ`, `ㄱㅏㄱ` 후 Backspace가 모두 기대값으로 shell 파일에 기록됨
 
 Simulator 결과는 smoke/regression 증거입니다. 최종 acceptance는 실제 iPadOS Safari/Chrome의 software keyboard와 hardware keyboard에서 확인합니다.
 
@@ -149,6 +151,7 @@ npm run watch -- --bind-addr=0.0.0.0:18080 --auth=none --disable-workspace-trust
 - 같은 자모가 실제로 반복 입력되는 `닭갈` 같은 케이스를 보존하기 위해 같은 입력 source의 반복은 보존하고, text/binary/CSI-u/composition 사이의 mirror duplicate만 180ms window에서 무시합니다.
 - 마지막 조합 글자와 Enter는 한 번의 terminal data write로 전달합니다. 별도 async write로 보내면 raw-mode 앱이 Enter를 먼저 처리해 마지막 글자를 놓칠 수 있습니다.
 - 일부 iPadOS key path는 Enter keydown만 발생시키고 terminal data event를 만들지 않으므로, pending 조합이 있을 때는 keydown fallback이 submit을 담당합니다.
+- 일부 iPadOS/WebDriver key path는 Backspace를 key event와 raw data 양쪽으로 전달하므로, pending 조합 중에는 즉시 따라오는 Backspace duplicate를 무시합니다.
 - Codex CLI 같은 raw-mode TUI는 xterm.js `onBinary` 또는 CSI-u keyboard protocol로 key input을 받을 수 있으므로 bridge는 binary UTF-8 data와 CSI-u Unicode key sequence도 같은 조합 경로를 태웁니다.
 - 후보 선택, 일본어/중국어 변환, punctuation 변환 보정은 의도적으로 구현하지 않았습니다.
 - bridge 실패 시 다음 대안은 xterm.js 교체가 아니라 `ghostty-web` API 호환성 검토입니다.

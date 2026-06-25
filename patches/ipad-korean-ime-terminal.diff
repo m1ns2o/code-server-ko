@@ -14,7 +14,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 ===================================================================
 --- /dev/null
 +++ code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipadKoreanImeBridge.ts
-@@ -0,0 +1,892 @@
+@@ -0,0 +1,904 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -30,6 +30,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +const enum Constants {
 +	IgnoreWindow = 750,
 +	DuplicateWindow = 120,
++	BackspaceDuplicateWindow = 80,
 +	MirrorDuplicateWindow = 180
 +}
 +
@@ -70,6 +71,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +	private _lastInputData = '';
 +	private _compositionJamoText = '';
 +	private _ignoreUntil = 0;
++	private _ignoreBackspaceUntil = 0;
 +	private _finalizeTimer: number | undefined;
 +	private _previewTimer: number | undefined;
 +	private _previewWidth = 0;
@@ -100,8 +102,13 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +			}
 +
 +			if (event.key === 'Backspace') {
++				if (Date.now() < this._ignoreBackspaceUntil) {
++					return false;
++				}
 +				this._jamoComposer.backspace();
 +				this._markIgnoreWindow();
++				this._ignoreBackspaceUntil = Date.now() + Constants.BackspaceDuplicateWindow;
++				this._schedulePreviewUpdate();
 +				return false;
 +			}
 +
@@ -161,9 +168,14 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipa
 +			}
 +		}
 +
++		if (isBackspace(data) && Date.now() < this._ignoreBackspaceUntil) {
++			return undefined;
++		}
++
 +		if (isBackspace(data) && this._jamoComposer.hasPending()) {
 +			this._jamoComposer.backspace();
 +			this._markIgnoreWindow();
++			this._ignoreBackspaceUntil = Date.now() + Constants.BackspaceDuplicateWindow;
 +			this._schedulePreviewUpdate();
 +			return undefined;
 +		}
