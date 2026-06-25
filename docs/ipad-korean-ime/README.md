@@ -13,7 +13,15 @@
 
 code-server는 VS Code 소스를 `lib/vscode` submodule로 가져오고 `patches/`의 quilt patch를 적용합니다. 이 기능도 같은 방식으로 관리합니다.
 
-핵심 patch는 `patches/ipad-korean-ime-terminal.diff`입니다. 이 patch는 VS Code 통합 터미널 생성 시점에 `IpadKoreanImeBridge`를 연결합니다.
+핵심 patch는 `patches/ipad-korean-ime-terminal.diff`입니다. 이 patch는 VS Code 통합 터미널 생성 시점에 별도 repo의 `xterm-ko-ime-adapter`를 연결합니다.
+
+adapter repo는 code-server checkout과 같은 상위 폴더에 둡니다.
+
+```text
+/Users/m1ns2o128/
+  code-server-ipad/
+  xterm-ko-ime-adapter/
+```
 
 브리지는 다음 조건에서만 활성화됩니다.
 
@@ -24,7 +32,7 @@ code-server는 VS Code 소스를 `lib/vscode` submodule로 가져오고 `patches
 `MacIntel` platform으로 보이더라도 touch point가 있는 WebKit 브라우저면 bridge를
 켭니다.
 
-활성화되면 브리지는 xterm.js를 교체하지 않고 입력 경계만 보정합니다.
+활성화되면 adapter는 xterm.js를 교체하지 않고 입력 경계만 보정합니다.
 
 - `compositionstart`, `compositionupdate`, `compositionend`, `beforeinput`, `input` 이벤트를 추적합니다.
 - xterm.js의 `raw.onData`와 `raw.onBinary` 앞에서 한글 자모 입력을 가로챕니다.
@@ -65,8 +73,11 @@ docs/
 lib/vscode/src/vs/platform/terminal/common/
   terminal.ts
 
+lib/vscode/
+  package.json
+  package-lock.json
+
 lib/vscode/src/vs/workbench/contrib/terminal/browser/
-  ipadKoreanImeBridge.ts
   terminalInstance.ts
 
 lib/vscode/src/vs/workbench/contrib/terminal/common/
@@ -129,6 +140,7 @@ patch를 수정할 때:
 ```bash
 git submodule update --init
 quilt push -a
+npm install --prefix lib/vscode
 
 # edit lib/vscode files
 
@@ -147,6 +159,7 @@ npm run watch -- --bind-addr=0.0.0.0:18080 --auth=none --disable-workspace-trust
 ## Maintenance Notes
 
 - 한글 조합기는 compatibility jamo 범위 `U+3131..U+3163`만 처리합니다.
+- 한글 조합/IME 로직은 `/Users/m1ns2o128/xterm-ko-ime-adapter`에 있고, code-server patch는 VS Code 터미널에 adapter를 붙이는 얇은 연결부만 유지합니다.
 - 완성형 한글이 composition event로 정상 전달되는 경우에는 그대로 전달하되, 같은 composition 안에서 모음-only 자모 후보가 있으면 `아/오`보다 `ㅏ/ㅗ`를 우선합니다.
 - 같은 자모가 실제로 반복 입력되는 `닭갈` 같은 케이스를 보존하기 위해 같은 입력 source의 반복은 보존하고, text/binary/CSI-u/composition 사이의 mirror duplicate만 180ms window에서 무시합니다.
 - 마지막 조합 글자와 Enter는 한 번의 terminal data write로 전달합니다. 별도 async write로 보내면 raw-mode 앱이 Enter를 먼저 처리해 마지막 글자를 놓칠 수 있습니다.

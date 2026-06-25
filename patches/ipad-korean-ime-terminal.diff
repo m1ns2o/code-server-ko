@@ -10,932 +10,23 @@ Index: code-server-ipad/lib/vscode/src/vs/platform/terminal/common/terminal.ts
  
  	// Developer/debug settings
  
-Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipadKoreanImeBridge.ts
-===================================================================
---- /dev/null
-+++ code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ipadKoreanImeBridge.ts
-@@ -0,0 +1,904 @@
-+/*---------------------------------------------------------------------------------------------
-+ *  Copyright (c) Microsoft Corporation. All rights reserved.
-+ *  Licensed under the MIT License. See License.txt in the project root for license information.
-+ *--------------------------------------------------------------------------------------------*/
-+
-+import { isWebKit } from '../../../../base/browser/browser.js';
-+import * as dom from '../../../../base/browser/dom.js';
-+import { Disposable } from '../../../../base/common/lifecycle.js';
-+import { isIOS } from '../../../../base/common/platform.js';
-+
-+export type IpadKoreanImeMode = 'auto' | 'on' | 'off';
-+
-+const enum Constants {
-+	IgnoreWindow = 750,
-+	DuplicateWindow = 120,
-+	BackspaceDuplicateWindow = 80,
-+	MirrorDuplicateWindow = 180
-+}
-+
-+interface ISentData {
-+	readonly data: string;
-+	readonly expiresAt: number;
-+}
-+
-+interface IRecentBufferedJamo {
-+	readonly data: string;
-+	readonly source: KoreanInputSource;
-+	readonly expiresAt: number;
-+}
-+
-+type KoreanInputSource = 'text' | 'binary' | 'textKeyboardProtocol' | 'binaryKeyboardProtocol' | 'composition';
-+
-+const hangulRegex = /[\u1100-\u11FF\u3130-\u318F\uA960-\uA97F\uAC00-\uD7AF\uD7B0-\uD7FF]/;
-+const compatibilityJamoCharRegex = /[\u3131-\u3163]/;
-+const compatibilityJamoRegex = /^[\u3131-\u3163]+$/;
-+const koreanInputTextRegex = /^[\u3131-\u3163\uAC00-\uD7A3]+$/;
-+const utf8Decoder = new TextDecoder();
-+const utf8Encoder = new TextEncoder();
-+
-+/**
-+ * iPadOS WebKit can deliver Korean IME composition through textarea mutations that xterm.js'
-+ * keydown-first input path drops or duplicates. This bridge only takes over Hangul composition
-+ * data on iPad and lets xterm keep handling regular keys, control sequences, paste and selection.
-+ */
-+export class IpadKoreanImeBridge extends Disposable {
-+	static shouldEnable(mode: IpadKoreanImeMode): boolean {
-+		return mode === 'on' || (mode === 'auto' && isIpadOSWebKit());
-+	}
-+
-+	private _isComposing = false;
-+	private _isFinalizing = false;
-+	private _compositionStartValue = '';
-+	private _lastCompositionData = '';
-+	private _lastInputData = '';
-+	private _compositionJamoText = '';
-+	private _ignoreUntil = 0;
-+	private _ignoreBackspaceUntil = 0;
-+	private _finalizeTimer: number | undefined;
-+	private _previewTimer: number | undefined;
-+	private _previewWidth = 0;
-+	private readonly _sentData: ISentData[] = [];
-+	private readonly _jamoComposer = new KoreanJamoComposer();
-+	private readonly _recentBufferedJamo: IRecentBufferedJamo[] = [];
-+
-+	constructor(
-+		private readonly _textarea: HTMLTextAreaElement,
-+		private readonly _sendData: (data: string) => void,
-+		private readonly _writePreviewData: (data: string) => void
-+	) {
-+		super();
-+		this._registerListeners();
-+	}
-+
-+	handleKeyEvent(event: KeyboardEvent): boolean | undefined {
-+		if (this._jamoComposer.hasPending()) {
-+			if (event.key === 'Enter') {
-+				const committed = this._drainJamoComposer();
-+				if (committed) {
-+					const data = committed + '\r';
-+					this._clearPreview();
-+					this._rememberSentData(data);
-+					this._sendData(data);
-+					return false;
-+				}
-+			}
-+
-+			if (event.key === 'Backspace') {
-+				if (Date.now() < this._ignoreBackspaceUntil) {
-+					return false;
-+				}
-+				this._jamoComposer.backspace();
-+				this._markIgnoreWindow();
-+				this._ignoreBackspaceUntil = Date.now() + Constants.BackspaceDuplicateWindow;
-+				this._schedulePreviewUpdate();
-+				return false;
-+			}
-+
-+			return undefined;
-+		}
-+
-+		if (!this._isComposing && !this._isFinalizing) {
-+			return undefined;
-+		}
-+
-+		if (event.key === 'Enter') {
-+			this._finalizeNow(this._lastCompositionData || this._lastInputData);
-+			return undefined;
-+		}
-+
-+		if (event.keyCode === 229 || event.key === 'Process' || event.key === 'Backspace') {
-+			this._markIgnoreWindow();
-+			return false;
-+		}
-+
-+		return undefined;
-+	}
-+
-+	handleXtermData(data: string): string | undefined {
-+		return this._handleXtermData(data, 'text');
-+	}
-+
-+	private _handleXtermData(data: string, source: KoreanInputSource): string | undefined {
-+		if (!data) {
-+			return data;
-+		}
-+
-+		this._pruneSentData();
-+
-+		if (this._consumeSentData(data)) {
-+			return undefined;
-+		}
-+
-+		const keyboardProtocolData = decodeKeyboardProtocolData(data);
-+		if (keyboardProtocolData !== undefined) {
-+			const keyboardProtocolSource = getKeyboardProtocolSource(source);
-+			if (isKoreanInputText(keyboardProtocolData)) {
-+				if (this._isComposing || this._isFinalizing) {
-+					this._rememberCompositionJamoText(keyboardProtocolData);
-+					this._markIgnoreWindow();
-+					return undefined;
-+				}
-+				if (this._consumeRecentBufferedJamo(keyboardProtocolData, keyboardProtocolSource)) {
-+					return undefined;
-+				}
-+				this._bufferKoreanText(keyboardProtocolData, true, keyboardProtocolSource, Constants.MirrorDuplicateWindow);
-+				return undefined;
-+			}
-+
-+			if (this._jamoComposer.hasPending()) {
-+				return this._handleXtermData(keyboardProtocolData, keyboardProtocolSource);
-+			}
-+		}
-+
-+		if (isBackspace(data) && Date.now() < this._ignoreBackspaceUntil) {
-+			return undefined;
-+		}
-+
-+		if (isBackspace(data) && this._jamoComposer.hasPending()) {
-+			this._jamoComposer.backspace();
-+			this._markIgnoreWindow();
-+			this._ignoreBackspaceUntil = Date.now() + Constants.BackspaceDuplicateWindow;
-+			this._schedulePreviewUpdate();
-+			return undefined;
-+		}
-+
-+		if (isKoreanInputText(data) && containsCompatibilityJamo(data)) {
-+			if (this._isComposing || this._isFinalizing) {
-+				this._rememberCompositionJamoText(data);
-+				this._markIgnoreWindow();
-+				return undefined;
-+			}
-+			if (this._consumeRecentBufferedJamo(data, source)) {
-+				return undefined;
-+			}
-+			this._bufferKoreanText(data, true, source, Constants.MirrorDuplicateWindow);
-+			return undefined;
-+		}
-+
-+		const now = Date.now();
-+		if ((this._isComposing || this._isFinalizing || now < this._ignoreUntil) && containsHangul(data)) {
-+			return undefined;
-+		}
-+
-+		if (this._jamoComposer.hasPending()) {
-+			const committed = this._drainJamoComposer();
-+			if (committed) {
-+				this._clearPreview();
-+				return committed + data;
-+			}
-+		}
-+
-+		return data;
-+	}
-+
-+	handleXtermBinary(data: string): string | undefined {
-+		if (!data) {
-+			return data;
-+		}
-+
-+		const decodedData = decodeBinaryData(data);
-+		const keyboardProtocolData = decodeKeyboardProtocolData(decodedData);
-+		if (!this._jamoComposer.hasPending() && !containsHangul(decodedData) && !containsHangul(keyboardProtocolData ?? '')) {
-+			return data;
-+		}
-+
-+		const bridgedData = this._handleXtermData(decodedData, 'binary');
-+		if (bridgedData === undefined) {
-+			return undefined;
-+		}
-+		if (bridgedData === decodedData) {
-+			return data;
-+		}
-+		return encodeBinaryData(bridgedData);
-+	}
-+
-+	override dispose(): void {
-+		if (this._finalizeTimer !== undefined) {
-+			dom.getWindow(this._textarea).clearTimeout(this._finalizeTimer);
-+			this._finalizeTimer = undefined;
-+		}
-+		if (this._previewTimer !== undefined) {
-+			dom.getWindow(this._textarea).clearTimeout(this._previewTimer);
-+			this._previewTimer = undefined;
-+		}
-+		this._clearPreview();
-+		super.dispose();
-+	}
-+
-+	willWriteProcessData(): void {
-+		this._clearPreview();
-+	}
-+
-+	didWriteProcessData(): void {
-+		this._schedulePreviewUpdate();
-+	}
-+
-+	private _registerListeners(): void {
-+		this._register(dom.addDisposableListener(this._textarea, 'compositionstart', () => this._handleCompositionStart(), true));
-+		this._register(dom.addDisposableListener(this._textarea, 'compositionupdate', event => this._handleCompositionUpdate(event), true));
-+		this._register(dom.addDisposableListener(this._textarea, 'compositionend', event => this._handleCompositionEnd(event), true));
-+		this._register(dom.addDisposableListener(this._textarea, 'beforeinput', event => this._handleBeforeInput(event as InputEvent), true));
-+		this._register(dom.addDisposableListener(this._textarea, 'input', event => this._handleInput(event as InputEvent), true));
-+	}
-+
-+	private _handleCompositionStart(): void {
-+		this._isComposing = true;
-+		this._isFinalizing = false;
-+		this._compositionStartValue = this._textarea.value;
-+		this._lastCompositionData = '';
-+		this._lastInputData = '';
-+		this._compositionJamoText = '';
-+		this._markIgnoreWindow();
-+	}
-+
-+	private _handleCompositionUpdate(event: CompositionEvent): void {
-+		if (containsHangul(event.data)) {
-+			this._lastCompositionData = event.data;
-+			if (isKoreanJamoText(event.data)) {
-+				this._rememberCompositionJamoText(event.data);
-+			}
-+			this._markIgnoreWindow();
-+		}
-+	}
-+
-+	private _handleCompositionEnd(event: CompositionEvent): void {
-+		if (containsHangul(event.data)) {
-+			this._lastCompositionData = event.data;
-+			if (isKoreanJamoText(event.data)) {
-+				this._rememberCompositionJamoText(event.data);
-+			}
-+		}
-+		this._isComposing = false;
-+		this._isFinalizing = true;
-+		this._markIgnoreWindow();
-+		this._scheduleFinalize(event.data);
-+	}
-+
-+	private _handleBeforeInput(event: InputEvent): void {
-+		if (event.isComposing || event.inputType === 'insertCompositionText' || containsHangul(event.data ?? '')) {
-+			if (containsHangul(event.data ?? '')) {
-+				this._lastInputData = event.data ?? '';
-+			}
-+			if (isKoreanJamoText(event.data ?? '')) {
-+				this._rememberCompositionJamoText(event.data ?? '');
-+			}
-+			this._markIgnoreWindow();
-+		}
-+	}
-+
-+	private _handleInput(event: InputEvent): void {
-+		if (event.isComposing || event.inputType === 'insertCompositionText') {
-+			const data = event.data ?? '';
-+			if (containsHangul(data)) {
-+				this._lastInputData = data;
-+				if (isKoreanJamoText(data)) {
-+					this._rememberCompositionJamoText(data);
-+				}
-+			}
-+			this._markIgnoreWindow();
-+			return;
-+		}
-+
-+		if ((this._isComposing || this._isFinalizing) && containsHangul(event.data ?? '')) {
-+			this._lastInputData = event.data ?? '';
-+			if (isKoreanJamoText(event.data ?? '')) {
-+				this._rememberCompositionJamoText(event.data ?? '');
-+			}
-+			this._scheduleFinalize(event.data ?? '');
-+		}
-+	}
-+
-+	private _scheduleFinalize(fallback: string): void {
-+		if (this._finalizeTimer !== undefined) {
-+			dom.getWindow(this._textarea).clearTimeout(this._finalizeTimer);
-+		}
-+
-+		this._finalizeTimer = dom.getWindow(this._textarea).setTimeout(() => {
-+			this._finalizeTimer = undefined;
-+			this._finalizeNow(fallback);
-+		}, 0);
-+	}
-+
-+	private _finalizeNow(fallback: string): void {
-+		const data = this._resolveFinalData(fallback);
-+		this._isComposing = false;
-+		this._isFinalizing = false;
-+		this._lastCompositionData = '';
-+		this._lastInputData = '';
-+		this._compositionJamoText = '';
-+		this._compositionStartValue = this._textarea.value;
-+
-+		if (!data || !containsHangul(data)) {
-+			return;
-+		}
-+
-+		if (isKoreanInputText(data)) {
-+			this._bufferKoreanText(data, true, 'composition');
-+			return;
-+		}
-+
-+		this._rememberSentData(data);
-+		this._markIgnoreWindow();
-+		this._sendData(data);
-+	}
-+
-+	private _resolveFinalData(fallback: string): string {
-+		const insertedText = getInsertedText(this._compositionStartValue, this._textarea.value);
-+		const jamoCandidates = [this._compositionJamoText, this._lastCompositionData, this._lastInputData, fallback, insertedText]
-+			.filter(isKoreanJamoText)
-+			.sort((a, b) => b.length - a.length);
-+		const vowelOnlyJamo = jamoCandidates.find(isVowelOnlyJamoText);
-+		if (vowelOnlyJamo) {
-+			return vowelOnlyJamo;
-+		}
-+
-+		for (const value of [this._lastCompositionData, this._lastInputData, fallback]) {
-+			if (containsPrecomposedHangul(value)) {
-+				return value;
-+			}
-+		}
-+
-+		if (containsPrecomposedHangul(insertedText)) {
-+			return insertedText;
-+		}
-+
-+		if (jamoCandidates.length) {
-+			return jamoCandidates[0];
-+		}
-+
-+		for (const value of [this._lastCompositionData, this._lastInputData, fallback, insertedText]) {
-+			if (containsHangul(value)) {
-+				return value;
-+			}
-+		}
-+
-+		return '';
-+	}
-+
-+	private _markIgnoreWindow(): void {
-+		this._ignoreUntil = Date.now() + Constants.IgnoreWindow;
-+	}
-+
-+	private _bufferKoreanText(data: string, rememberRecentBufferedJamo: boolean, source: KoreanInputSource, duplicateWindow = Constants.DuplicateWindow): void {
-+		const committed = this._jamoComposer.inputKoreanText(data);
-+
-+		if (rememberRecentBufferedJamo) {
-+			this._rememberRecentBufferedJamo(data, source, duplicateWindow);
-+		}
-+		this._markIgnoreWindow();
-+
-+		if (committed) {
-+			this._clearPreview();
-+			this._rememberSentData(committed);
-+			this._sendData(committed);
-+			this._schedulePreviewUpdate();
-+			return;
-+		}
-+
-+		this._updatePreview();
-+	}
-+
-+	private _rememberCompositionJamoText(data: string): void {
-+		if (!data) {
-+			return;
-+		}
-+		if (!this._compositionJamoText || data.startsWith(this._compositionJamoText)) {
-+			this._compositionJamoText = data;
-+			return;
-+		}
-+		if (this._compositionJamoText.endsWith(data)) {
-+			return;
-+		}
-+		this._compositionJamoText += data;
-+	}
-+
-+	private _drainJamoComposer(): string {
-+		const committed = this._jamoComposer.flush();
-+		if (committed) {
-+			this._markIgnoreWindow();
-+		}
-+		return committed;
-+	}
-+
-+	private _schedulePreviewUpdate(): void {
-+		if (this._previewTimer !== undefined) {
-+			dom.getWindow(this._textarea).clearTimeout(this._previewTimer);
-+		}
-+		this._previewTimer = dom.getWindow(this._textarea).setTimeout(() => {
-+			this._previewTimer = undefined;
-+			this._updatePreview();
-+		}, 30);
-+	}
-+
-+	private _updatePreview(): void {
-+		this._clearPreview();
-+		const previewText = this._jamoComposer.preview();
-+		if (!previewText) {
-+			return;
-+		}
-+		this._previewWidth = getTerminalCellWidth(previewText);
-+		this._writePreviewData(`\x1b[s${previewText}\x1b[u`);
-+	}
-+
-+	private _clearPreview(): void {
-+		if (this._previewTimer !== undefined) {
-+			dom.getWindow(this._textarea).clearTimeout(this._previewTimer);
-+			this._previewTimer = undefined;
-+		}
-+		if (!this._previewWidth) {
-+			return;
-+		}
-+		this._writePreviewData(`\x1b[s${' '.repeat(this._previewWidth)}\x1b[u`);
-+		this._previewWidth = 0;
-+	}
-+
-+	private _rememberSentData(data: string): void {
-+		this._sentData.push({ data, expiresAt: Date.now() + Constants.DuplicateWindow });
-+		this._pruneSentData();
-+	}
-+
-+	private _consumeSentData(data: string): boolean {
-+		const index = this._sentData.findIndex(entry => entry.data === data);
-+		if (index === -1) {
-+			return false;
-+		}
-+		this._sentData.splice(index, 1);
-+		return true;
-+	}
-+
-+	private _pruneSentData(): void {
-+		const now = Date.now();
-+		for (let i = this._sentData.length - 1; i >= 0; i--) {
-+			if (this._sentData[i].expiresAt < now) {
-+				this._sentData.splice(i, 1);
-+			}
-+		}
-+		for (let i = this._recentBufferedJamo.length - 1; i >= 0; i--) {
-+			if (this._recentBufferedJamo[i].expiresAt < now) {
-+				this._recentBufferedJamo.splice(i, 1);
-+			}
-+		}
-+	}
-+
-+	private _rememberRecentBufferedJamo(data: string, source: KoreanInputSource, duplicateWindow = Constants.DuplicateWindow): void {
-+		this._recentBufferedJamo.push({ data, source, expiresAt: Date.now() + duplicateWindow });
-+		this._pruneSentData();
-+	}
-+
-+	private _consumeRecentBufferedJamo(data: string, source: KoreanInputSource): boolean {
-+		this._pruneSentData();
-+		return this._recentBufferedJamo.some(entry => entry.data === data && entry.source !== source);
-+	}
-+}
-+
-+function containsHangul(value: string): boolean {
-+	return hangulRegex.test(value);
-+}
-+
-+function isIpadOSWebKit(): boolean {
-+	return isWebKit && (isIOS || isIpadOSDesktopMode());
-+}
-+
-+function isIpadOSDesktopMode(): boolean {
-+	return navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1;
-+}
-+
-+function containsPrecomposedHangul(value: string): boolean {
-+	return /[\uAC00-\uD7AF]/.test(value);
-+}
-+
-+function isKoreanJamoText(value: string): boolean {
-+	return compatibilityJamoRegex.test(value);
-+}
-+
-+function isVowelOnlyJamoText(value: string): boolean {
-+	return !!value && [...value].every(isMedial);
-+}
-+
-+function containsCompatibilityJamo(value: string): boolean {
-+	return compatibilityJamoCharRegex.test(value);
-+}
-+
-+function isKoreanInputText(value: string): boolean {
-+	return koreanInputTextRegex.test(value);
-+}
-+
-+function isBackspace(value: string): boolean {
-+	return value === '\x7f' || value === '\b';
-+}
-+
-+function getKeyboardProtocolSource(source: KoreanInputSource): KoreanInputSource {
-+	return source === 'binary' || source === 'binaryKeyboardProtocol' ? 'binaryKeyboardProtocol' : 'textKeyboardProtocol';
-+}
-+
-+function getTerminalCellWidth(value: string): number {
-+	let width = 0;
-+	for (const char of value) {
-+		width += containsHangul(char) ? 2 : 1;
-+	}
-+	return width;
-+}
-+
-+function decodeBinaryData(value: string): string {
-+	const bytes = Uint8Array.from(value, char => char.charCodeAt(0));
-+	return utf8Decoder.decode(bytes);
-+}
-+
-+function encodeBinaryData(value: string): string {
-+	let result = '';
-+	for (const byte of utf8Encoder.encode(value)) {
-+		result += String.fromCharCode(byte);
-+	}
-+	return result;
-+}
-+
-+function decodeKeyboardProtocolData(value: string): string | undefined {
-+	const regex = /\x1b\[(\d+)(?:;[\d:]+)?u/g;
-+	let result = '';
-+	let index = 0;
-+	let match: RegExpExecArray | null;
-+	while ((match = regex.exec(value)) !== null) {
-+		if (match.index !== index) {
-+			return undefined;
-+		}
-+		const codePoint = Number(match[1]);
-+		if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10FFFF) {
-+			return undefined;
-+		}
-+		result += String.fromCodePoint(codePoint);
-+		index = regex.lastIndex;
-+	}
-+	return result && index === value.length ? result : undefined;
-+}
-+
-+function getInsertedText(before: string, after: string): string {
-+	let start = 0;
-+	while (start < before.length && start < after.length && before.charCodeAt(start) === after.charCodeAt(start)) {
-+		start++;
-+	}
-+
-+	let beforeEnd = before.length;
-+	let afterEnd = after.length;
-+	while (beforeEnd > start && afterEnd > start && before.charCodeAt(beforeEnd - 1) === after.charCodeAt(afterEnd - 1)) {
-+		beforeEnd--;
-+		afterEnd--;
-+	}
-+
-+	return after.substring(start, afterEnd);
-+}
-+
-+const leadingConsonants = ['ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ'];
-+const medialVowels = ['ㅏ', 'ㅐ', 'ㅑ', 'ㅒ', 'ㅓ', 'ㅔ', 'ㅕ', 'ㅖ', 'ㅗ', 'ㅘ', 'ㅙ', 'ㅚ', 'ㅛ', 'ㅜ', 'ㅝ', 'ㅞ', 'ㅟ', 'ㅠ', 'ㅡ', 'ㅢ', 'ㅣ'];
-+const trailingConsonants = ['', 'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', 'ㄻ', 'ㄼ', 'ㄽ', 'ㄾ', 'ㄿ', 'ㅀ', 'ㅁ', 'ㅂ', 'ㅄ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ'];
-+
-+const compoundMedials = new Map<string, string>([
-+	['ㅗㅏ', 'ㅘ'], ['ㅗㅐ', 'ㅙ'], ['ㅗㅣ', 'ㅚ'],
-+	['ㅜㅓ', 'ㅝ'], ['ㅜㅔ', 'ㅞ'], ['ㅜㅣ', 'ㅟ'],
-+	['ㅡㅣ', 'ㅢ']
-+]);
-+
-+const splitCompoundMedials = new Map<string, string[]>([
-+	['ㅘ', ['ㅗ', 'ㅏ']], ['ㅙ', ['ㅗ', 'ㅐ']], ['ㅚ', ['ㅗ', 'ㅣ']],
-+	['ㅝ', ['ㅜ', 'ㅓ']], ['ㅞ', ['ㅜ', 'ㅔ']], ['ㅟ', ['ㅜ', 'ㅣ']],
-+	['ㅢ', ['ㅡ', 'ㅣ']]
-+]);
-+
-+const compoundTrails = new Map<string, string>([
-+	['ㄱㅅ', 'ㄳ'], ['ㄴㅈ', 'ㄵ'], ['ㄴㅎ', 'ㄶ'],
-+	['ㄹㄱ', 'ㄺ'], ['ㄹㅁ', 'ㄻ'], ['ㄹㅂ', 'ㄼ'], ['ㄹㅅ', 'ㄽ'], ['ㄹㅌ', 'ㄾ'], ['ㄹㅍ', 'ㄿ'], ['ㄹㅎ', 'ㅀ'],
-+	['ㅂㅅ', 'ㅄ']
-+]);
-+
-+const splitCompoundTrail = new Map<string, [string, string]>([
-+	['ㄳ', ['ㄱ', 'ㅅ']], ['ㄵ', ['ㄴ', 'ㅈ']], ['ㄶ', ['ㄴ', 'ㅎ']],
-+	['ㄺ', ['ㄹ', 'ㄱ']], ['ㄻ', ['ㄹ', 'ㅁ']], ['ㄼ', ['ㄹ', 'ㅂ']], ['ㄽ', ['ㄹ', 'ㅅ']], ['ㄾ', ['ㄹ', 'ㅌ']], ['ㄿ', ['ㄹ', 'ㅍ']], ['ㅀ', ['ㄹ', 'ㅎ']],
-+	['ㅄ', ['ㅂ', 'ㅅ']]
-+]);
-+
-+export class KoreanJamoComposer {
-+	private _leading = '';
-+	private _medial = '';
-+	private _trailing = '';
-+	private readonly _history: string[] = [];
-+
-+	hasPending(): boolean {
-+		return !!(this._leading || this._medial || this._trailing);
-+	}
-+
-+	inputKoreanText(value: string): string {
-+		let committed = '';
-+		for (const char of value) {
-+			if (isKoreanJamoText(char)) {
-+				committed += this.input(char);
-+				continue;
-+			}
-+
-+			const jamo = decomposeHangulSyllable(char);
-+			if (jamo) {
-+				committed += this._inputSyllableJamo(jamo);
-+				continue;
-+			}
-+
-+			committed += this.flush() + char;
-+		}
-+		return committed;
-+	}
-+
-+	input(char: string): string {
-+		if (!isKoreanJamoText(char)) {
-+			return this.flush() + char;
-+		}
-+
-+		this._history.push(char);
-+		const committed = this._inputCore(char);
-+		this._normalizeDanglingVowel();
-+		this._syncHistoryToPending();
-+		return committed;
-+	}
-+
-+	backspace(): void {
-+		if (this._history.length === 0) {
-+			this.clear();
-+			return;
-+		}
-+
-+		this._history.pop();
-+		const history = [...this._history];
-+		this.clear();
-+		this._history.length = 0;
-+		for (const char of history) {
-+			this.input(char);
-+		}
-+	}
-+
-+	flush(): string {
-+		const committed = this._composePending();
-+		this.clear();
-+		return committed;
-+	}
-+
-+	preview(): string {
-+		return this._composePending();
-+	}
-+
-+	private clear(): void {
-+		this._leading = '';
-+		this._medial = '';
-+		this._trailing = '';
-+		this._history.length = 0;
-+	}
-+
-+	private _inputSyllableJamo(jamo: string[]): string {
-+		const pending = this._getPendingJamo();
-+		let input = jamo;
-+
-+		if (pending.length > 0 && startsWithJamo(jamo, pending)) {
-+			input = jamo.slice(pending.length);
-+		} else if (pending.length > 0 && jamo[0] === 'ㅇ' && jamo.length > 1 && isMedial(jamo[1])) {
-+			input = jamo.slice(1);
-+		}
-+
-+		let committed = '';
-+		for (const char of input) {
-+			committed += this.input(char);
-+		}
-+		return committed;
-+	}
-+
-+	private _syncHistoryToPending(): void {
-+		this._history.length = 0;
-+		this._history.push(...this._getPendingJamo());
-+	}
-+
-+	private _getPendingJamo(): string[] {
-+		const result: string[] = [];
-+		if (this._leading) {
-+			result.push(this._leading);
-+		}
-+		if (this._medial) {
-+			result.push(...expandMedial(this._medial));
-+		}
-+		if (this._trailing) {
-+			result.push(...expandTrailing(this._trailing));
-+		}
-+		return result;
-+	}
-+
-+	private _inputCore(char: string): string {
-+		if (isMedial(char)) {
-+			return this._inputMedial(char);
-+		}
-+		if (isLeading(char) || isTrailing(char)) {
-+			return this._inputConsonant(char);
-+		}
-+		return this.flush() + char;
-+	}
-+
-+	private _inputMedial(char: string): string {
-+		if (!this._leading) {
-+			if (this._medial) {
-+				const committed = this._medial;
-+				this._medial = char;
-+				return committed;
-+			}
-+			this._medial = char;
-+			return '';
-+		}
-+
-+		if (!this._medial) {
-+			this._medial = char;
-+			return '';
-+		}
-+
-+		if (!this._trailing) {
-+			const compound = compoundMedials.get(this._medial + char);
-+			if (compound) {
-+				this._medial = compound;
-+				return '';
-+			}
-+
-+			const committed = this._composePending();
-+			this._leading = '';
-+			this._medial = char;
-+			this._trailing = '';
-+			return committed;
-+		}
-+
-+		const split = splitCompoundTrail.get(this._trailing);
-+		if (split) {
-+			const committed = composeSyllable(this._leading, this._medial, split[0]);
-+			this._leading = split[1];
-+			this._medial = char;
-+			this._trailing = '';
-+			return committed;
-+		}
-+
-+		const movedTrailing = this._trailing;
-+		const committed = composeSyllable(this._leading, this._medial, '');
-+		this._leading = movedTrailing;
-+		this._medial = char;
-+		this._trailing = '';
-+		return committed;
-+	}
-+
-+	private _inputConsonant(char: string): string {
-+		if (!this._leading) {
-+			if (this._medial) {
-+				const committed = this._medial;
-+				this._medial = '';
-+				this._leading = char;
-+				return committed;
-+			}
-+			this._leading = char;
-+			return '';
-+		}
-+
-+		if (!this._medial) {
-+			const committed = this._leading;
-+			this._leading = char;
-+			return committed;
-+		}
-+
-+		if (!this._trailing) {
-+			if (isTrailing(char)) {
-+				this._trailing = char;
-+				return '';
-+			}
-+
-+			const committed = this._composePending();
-+			this._leading = char;
-+			this._medial = '';
-+			this._trailing = '';
-+			return committed;
-+		}
-+
-+		const compound = compoundTrails.get(this._trailing + char);
-+		if (compound) {
-+			this._trailing = compound;
-+			return '';
-+		}
-+
-+		const committed = this._composePending();
-+		this._leading = char;
-+		this._medial = '';
-+		this._trailing = '';
-+		return committed;
-+	}
-+
-+	private _normalizeDanglingVowel(): void {
-+		if (this._leading === 'ㅇ' && this._medial && !this._trailing) {
-+			return;
-+		}
-+	}
-+
-+	private _composePending(): string {
-+		if (this._leading && this._medial) {
-+			return composeSyllable(this._leading, this._medial, this._trailing);
-+		}
-+		return this._leading + this._medial + this._trailing;
-+	}
-+}
-+
-+function isLeading(char: string): boolean {
-+	return leadingConsonants.includes(char);
-+}
-+
-+function isMedial(char: string): boolean {
-+	return medialVowels.includes(char);
-+}
-+
-+function isTrailing(char: string): boolean {
-+	return trailingConsonants.includes(char);
-+}
-+
-+function composeSyllable(leading: string, medial: string, trailing: string): string {
-+	const leadingIndex = leadingConsonants.indexOf(leading);
-+	const medialIndex = medialVowels.indexOf(medial);
-+	const trailingIndex = trailingConsonants.indexOf(trailing);
-+	if (leadingIndex === -1 || medialIndex === -1 || trailingIndex === -1) {
-+		return leading + medial + trailing;
-+	}
-+	return String.fromCharCode(0xAC00 + ((leadingIndex * 21) + medialIndex) * 28 + trailingIndex);
-+}
-+
-+function decomposeHangulSyllable(char: string): string[] | undefined {
-+	const codePoint = char.charCodeAt(0);
-+	if (codePoint < 0xAC00 || codePoint > 0xD7A3) {
-+		return undefined;
-+	}
-+
-+	const syllableIndex = codePoint - 0xAC00;
-+	const trailingIndex = syllableIndex % 28;
-+	const medialIndex = Math.floor(syllableIndex / 28) % 21;
-+	const leadingIndex = Math.floor(syllableIndex / 28 / 21);
-+	const trailing = trailingConsonants[trailingIndex];
-+	return [
-+		leadingConsonants[leadingIndex],
-+		...expandMedial(medialVowels[medialIndex]),
-+		...expandTrailing(trailing)
-+	];
-+}
-+
-+function expandMedial(medial: string): string[] {
-+	return splitCompoundMedials.get(medial) ?? [medial];
-+}
-+
-+function expandTrailing(trailing: string): string[] {
-+	if (!trailing) {
-+		return [];
-+	}
-+	return splitCompoundTrail.get(trailing) ?? [trailing];
-+}
-+
-+function startsWithJamo(value: string[], prefix: string[]): boolean {
-+	if (prefix.length > value.length) {
-+		return false;
-+	}
-+	for (let i = 0; i < prefix.length; i++) {
-+		if (value[i] !== prefix[i]) {
-+			return false;
-+		}
-+	}
-+	return true;
-+}
 Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
 ===================================================================
 --- code-server-ipad.orig/lib/vscode/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
 +++ code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
-@@ -68,6 +68,7 @@ import { getTerminalResourcesFromDragEve
- import { TerminalWidgetManager } from './widgets/widgetManager.js';
- import { LineDataEventAddon } from './xterm/lineDataEventAddon.js';
- import { XtermTerminal, getXtermScaledDimensions } from './xterm/xtermTerminal.js';
-+import { IpadKoreanImeBridge, type IpadKoreanImeMode } from './ipadKoreanImeBridge.js';
- import { IEnvironmentVariableInfo } from '../common/environmentVariable.js';
- import { ITerminalProcessManager, ITerminalProfileResolverService, ProcessState, TERMINAL_VIEW_ID, TerminalCommandId } from '../common/terminal.js';
- import { TERMINAL_BACKGROUND_COLOR } from '../common/terminalColorRegistry.js';
+@@ -90,6 +90,7 @@ import type { IMenu } from '../../../../
+ import { IContextMenuService } from '../../../../platform/contextview/browser/contextView.js';
+ import { TerminalContribCommandId } from '../terminalContribExports.js';
+ import type { IProgressState } from '@xterm/addon-progress';
++import { attachKoreanImeAdapter, shouldEnableKoreanImeAdapter, type KoreanImeMode, type XtermKoreanImeAdapter } from 'xterm-ko-ime-adapter';
+ import { generateUuid } from '../../../../base/common/uuid.js';
+ import { PromptInputState } from '../../../../platform/terminal/common/capabilities/commandDetection/promptInputModel.js';
+ import { hasKey, isNumber, isString } from '../../../../base/common/types.js';
 @@ -207,6 +208,7 @@ export class TerminalInstance extends Di
  	private _shellIntegrationInjectionInfo: ShellIntegrationInjectionFailureReason | undefined;
  	get shellIntegrationInjectionFailureReason(): ShellIntegrationInjectionFailureReason | undefined { return this._shellIntegrationInjectionInfo; }
  	private _lineDataEventAddon: LineDataEventAddon | undefined;
-+	private _ipadKoreanImeBridge: IpadKoreanImeBridge | undefined;
++	private _ipadKoreanImeBridge: XtermKoreanImeAdapter | undefined;
  	private readonly _scopedContextKeyService: IContextKeyService;
  	private _resizeDebouncer?: TerminalResizeDebouncer;
  
@@ -944,7 +35,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ter
  		this._register(this._processManager.onProcessData(e => this._onProcessData(e)));
  		this._register(xterm.raw.onData(async data => {
 +			if (this._ipadKoreanImeBridge) {
-+				const bridgedData = this._ipadKoreanImeBridge.handleXtermData(data);
++				const bridgedData = this._ipadKoreanImeBridge.handleData(data);
 +				if (bridgedData === undefined) {
 +					return;
 +				}
@@ -955,7 +46,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ter
 -		this._register(xterm.raw.onBinary(data => this._processManager.processBinary(data)));
 +		this._register(xterm.raw.onBinary(data => {
 +			if (this._ipadKoreanImeBridge) {
-+				const bridgedData = this._ipadKoreanImeBridge.handleXtermBinary(data);
++				const bridgedData = this._ipadKoreanImeBridge.handleBinary(data);
 +				if (bridgedData === undefined) {
 +					return;
 +				}
@@ -966,16 +57,23 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ter
  		// Init conpty compat and link handler after process creation as they rely on the
  		// underlying process OS
  		this._register(this._processManager.onProcessReady(async (processTraits) => {
-@@ -1132,12 +1150,27 @@ export class TerminalInstance extends Di
+@@ -1132,12 +1150,34 @@ export class TerminalInstance extends Di
  
  		this._setAriaLabel(xterm.raw, this._instanceId, this._title);
  
-+		const ipadKoreanImeMode = this._configurationService.getValue<IpadKoreanImeMode>(TerminalSettingId.CodeServerIpadKoreanImeMode) ?? 'auto';
-+		if (IpadKoreanImeBridge.shouldEnable(ipadKoreanImeMode)) {
-+			this._ipadKoreanImeBridge = this._register(new IpadKoreanImeBridge(xterm.raw.textarea, data => {
-+				void this._handleOnData(data);
-+			}, data => {
-+				xterm.raw.write(data);
++		const ipadKoreanImeMode = this._configurationService.getValue<KoreanImeMode>(TerminalSettingId.CodeServerIpadKoreanImeMode) ?? 'auto';
++		if (shouldEnableKoreanImeAdapter(ipadKoreanImeMode)) {
++			this._ipadKoreanImeBridge = this._register(attachKoreanImeAdapter({
++				terminal: xterm.raw,
++				textarea: xterm.raw.textarea,
++				mode: ipadKoreanImeMode,
++				installKeyEventHandler: false,
++				sendData: data => {
++					void this._handleOnData(data);
++				},
++				writePreview: data => {
++					xterm.raw.write(data);
++				}
 +			}));
 +		}
 +
@@ -994,7 +92,7 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/browser/ter
  			const standardKeyboardEvent = new StandardKeyboardEvent(event);
  			const resolveResult = this._keybindingService.softDispatch(standardKeyboardEvent, standardKeyboardEvent.target);
  
-@@ -1679,11 +1712,13 @@ export class TerminalInstance extends Di
+@@ -1679,11 +1719,13 @@ export class TerminalInstance extends Di
  	private _writeProcessData(data: string, cb?: () => void) {
  		this._onWillData.fire(data);
  		const messageId = ++this._latestXtermWriteData;
@@ -1031,3 +129,55 @@ Index: code-server-ipad/lib/vscode/src/vs/workbench/contrib/terminal/common/term
  	[TerminalSettingId.DeveloperPtyHostLatency]: {
  		description: localize('terminal.integrated.developer.ptyHost.latency', "Simulated latency in milliseconds applied to all calls made to the pty host. This is useful for testing terminal behavior under high latency conditions."),
  		type: 'number',
+Index: code-server-ipad/lib/vscode/package-lock.json
+===================================================================
+--- code-server-ipad.orig/lib/vscode/package-lock.json
++++ code-server-ipad/lib/vscode/package-lock.json
+@@ -72,6 +72,7 @@
+         "vscode-regexpp": "^3.1.0",
+         "vscode-textmate": "^9.3.2",
+         "ws": "^8.19.0",
++        "xterm-ko-ime-adapter": "file:../../../xterm-ko-ime-adapter",
+         "yauzl": "^3.3.1",
+         "yazl": "^2.4.3",
+         "zod": "^3.25.76"
+@@ -184,6 +185,16 @@
+         "windows-foreground-love": "0.6.1"
+       }
+     },
++    "../../../xterm-ko-ime-adapter": {
++      "version": "0.1.0",
++      "license": "MIT",
++      "devDependencies": {
++        "typescript": "^5.9.2"
++      },
++      "peerDependencies": {
++        "@xterm/xterm": ">=5"
++      }
++    },
+     "node_modules/@anthropic-ai/claude-agent-sdk": {
+       "version": "0.3.169",
+       "resolved": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/-/claude-agent-sdk-0.3.169.tgz",
+@@ -19979,6 +19990,10 @@
+         "node": ">=0.4"
+       }
+     },
++    "node_modules/xterm-ko-ime-adapter": {
++      "resolved": "../../../xterm-ko-ime-adapter",
++      "link": true
++    },
+     "node_modules/y18n": {
+       "version": "5.0.8",
+       "resolved": "https://registry.npmjs.org/y18n/-/y18n-5.0.8.tgz",
+Index: code-server-ipad/lib/vscode/package.json
+===================================================================
+--- code-server-ipad.orig/lib/vscode/package.json
++++ code-server-ipad/lib/vscode/package.json
+@@ -156,6 +156,7 @@
+     "vscode-regexpp": "^3.1.0",
+     "vscode-textmate": "^9.3.2",
+     "ws": "^8.19.0",
++    "xterm-ko-ime-adapter": "file:../../../xterm-ko-ime-adapter",
+     "yauzl": "^3.3.1",
+     "yazl": "^2.4.3",
+     "zod": "^3.25.76"
