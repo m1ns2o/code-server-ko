@@ -61,6 +61,12 @@ code-server.
 We also have an in-depth [setup and
 configuration](https://coder.com/docs/code-server/latest/guide) guide.
 
+## Fork notes
+
+- [iPad Korean IME terminal support](./ipad-korean-ime/README.md): Documents
+  this fork's workaround for Korean input in the integrated terminal on iPadOS
+  WebKit browsers.
+
 ## Questions?
 
 See answers to [frequently asked

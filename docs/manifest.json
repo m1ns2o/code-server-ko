@@ -45,7 +45,14 @@
         {
           "title": "iPad",
           "description": "How to access your code-server installation using an iPad.",
-          "path": "./ipad.md"
+          "path": "./ipad.md",
+          "children": [
+            {
+              "title": "iPad Korean IME",
+              "description": "How this fork fixes Korean input in the integrated terminal on iPadOS WebKit browsers.",
+              "path": "./ipad-korean-ime/README.md"
+            }
+          ]
         },
         {
           "title": "Termux",

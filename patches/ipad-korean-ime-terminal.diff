@@ -1,0 +1,183 @@
+Index: code-server/lib/vscode/src/vs/platform/terminal/common/terminal.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/platform/terminal/common/terminal.ts
++++ code-server/lib/vscode/src/vs/platform/terminal/common/terminal.ts
+@@ -127,6 +127,7 @@ export const enum TerminalSettingId {
+ 	EnableKittyKeyboardProtocol = 'terminal.integrated.enableKittyKeyboardProtocol',
+ 	EnableWin32InputMode = 'terminal.integrated.enableWin32InputMode',
+ 	AllowInUntrustedWorkspace = 'terminal.integrated.allowInUntrustedWorkspace',
++	CodeServerIpadKoreanImeMode = 'codeServer.terminal.iPadKoreanImeMode',
+ 
+ 	// Developer/debug settings
+ 
+Index: code-server/lib/vscode/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
+@@ -90,6 +90,7 @@ import type { IMenu } from '../../../../
+ import { IContextMenuService } from '../../../../platform/contextview/browser/contextView.js';
+ import { TerminalContribCommandId } from '../terminalContribExports.js';
+ import type { IProgressState } from '@xterm/addon-progress';
++import { attachKoreanImeAdapter, shouldEnableKoreanImeAdapter, type KoreanImeMode, type XtermKoreanImeAdapter } from 'xterm-ko-ime-adapter';
+ import { generateUuid } from '../../../../base/common/uuid.js';
+ import { PromptInputState } from '../../../../platform/terminal/common/capabilities/commandDetection/promptInputModel.js';
+ import { hasKey, isNumber, isString } from '../../../../base/common/types.js';
+@@ -207,6 +208,7 @@ export class TerminalInstance extends Di
+ 	private _shellIntegrationInjectionInfo: ShellIntegrationInjectionFailureReason | undefined;
+ 	get shellIntegrationInjectionFailureReason(): ShellIntegrationInjectionFailureReason | undefined { return this._shellIntegrationInjectionInfo; }
+ 	private _lineDataEventAddon: LineDataEventAddon | undefined;
++	private _ipadKoreanImeBridge: XtermKoreanImeAdapter | undefined;
+ 	private readonly _scopedContextKeyService: IContextKeyService;
+ 	private _resizeDebouncer?: TerminalResizeDebouncer;
+ 
+@@ -873,9 +875,25 @@ export class TerminalInstance extends Di
+ 
+ 		this._register(this._processManager.onProcessData(e => this._onProcessData(e)));
+ 		this._register(xterm.raw.onData(async data => {
++			if (this._ipadKoreanImeBridge) {
++				const bridgedData = this._ipadKoreanImeBridge.handleData(data);
++				if (bridgedData === undefined) {
++					return;
++				}
++				data = bridgedData;
++			}
+ 			await this._handleOnData(data);
+ 		}));
+-		this._register(xterm.raw.onBinary(data => this._processManager.processBinary(data)));
++		this._register(xterm.raw.onBinary(data => {
++			if (this._ipadKoreanImeBridge) {
++				const bridgedData = this._ipadKoreanImeBridge.handleBinary(data);
++				if (bridgedData === undefined) {
++					return;
++				}
++				data = bridgedData;
++			}
++			this._processManager.processBinary(data);
++		}));
+ 		// Init conpty compat and link handler after process creation as they rely on the
+ 		// underlying process OS
+ 		this._register(this._processManager.onProcessReady(async (processTraits) => {
+@@ -1132,12 +1150,34 @@ export class TerminalInstance extends Di
+ 
+ 		this._setAriaLabel(xterm.raw, this._instanceId, this._title);
+ 
++		const ipadKoreanImeMode = this._configurationService.getValue<KoreanImeMode>(TerminalSettingId.CodeServerIpadKoreanImeMode) ?? 'auto';
++		if (shouldEnableKoreanImeAdapter(ipadKoreanImeMode)) {
++			this._ipadKoreanImeBridge = this._register(attachKoreanImeAdapter({
++				terminal: xterm.raw,
++				textarea: xterm.raw.textarea,
++				mode: ipadKoreanImeMode,
++				installKeyEventHandler: false,
++				sendData: data => {
++					void this._handleOnData(data);
++				},
++				writePreview: data => {
++					xterm.raw.write(data);
++				}
++			}));
++		}
++
+ 		xterm.raw.attachCustomKeyEventHandler((event: KeyboardEvent): boolean => {
+ 			// Disable all input if the terminal is exiting
+ 			if (this._isExiting) {
+ 				return false;
+ 			}
+ 
++			const ipadKoreanImeResult = this._ipadKoreanImeBridge?.handleKeyEvent(event);
++			if (ipadKoreanImeResult === false) {
++				event.preventDefault();
++				return false;
++			}
++
+ 			const standardKeyboardEvent = new StandardKeyboardEvent(event);
+ 			const resolveResult = this._keybindingService.softDispatch(standardKeyboardEvent, standardKeyboardEvent.target);
+ 
+@@ -1679,11 +1719,13 @@ export class TerminalInstance extends Di
+ 	private _writeProcessData(data: string, cb?: () => void) {
+ 		this._onWillData.fire(data);
+ 		const messageId = ++this._latestXtermWriteData;
++		this._ipadKoreanImeBridge?.willWriteProcessData();
+ 		this.xterm?.raw.write(data, () => {
+ 			this._latestXtermParseData = messageId;
+ 			this._processManager.acknowledgeDataEvent(data.length);
+ 			cb?.();
+ 			this._onData.fire(data);
++			this._ipadKoreanImeBridge?.didWriteProcessData();
+ 		});
+ 	}
+ 
+Index: code-server/lib/vscode/src/vs/workbench/contrib/terminal/common/terminalConfiguration.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/terminal/common/terminalConfiguration.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/terminal/common/terminalConfiguration.ts
+@@ -677,6 +677,18 @@ const terminalConfiguration: IStringDict
+ 		type: 'boolean',
+ 		default: false
+ 	},
++	[TerminalSettingId.CodeServerIpadKoreanImeMode]: {
++		markdownDescription: localize('codeServer.terminal.iPadKoreanImeMode', "Controls the code-server workaround for Korean IME input in the integrated terminal on iPadOS WebKit browsers. This leaves the normal xterm.js input path unchanged on other platforms."),
++		type: 'string',
++		enum: ['auto', 'on', 'off'],
++		markdownEnumDescriptions: [
++			localize('codeServer.terminal.iPadKoreanImeMode.auto', "Enable the workaround only on iPadOS WebKit browsers."),
++			localize('codeServer.terminal.iPadKoreanImeMode.on', "Always enable the workaround for this browser session."),
++			localize('codeServer.terminal.iPadKoreanImeMode.off', "Disable the workaround.")
++		],
++		default: 'auto',
++		tags: ['experimental']
++	},
+ 	[TerminalSettingId.DeveloperPtyHostLatency]: {
+ 		description: localize('terminal.integrated.developer.ptyHost.latency', "Simulated latency in milliseconds applied to all calls made to the pty host. This is useful for testing terminal behavior under high latency conditions."),
+ 		type: 'number',
+Index: code-server/lib/vscode/package-lock.json
+===================================================================
+--- code-server.orig/lib/vscode/package-lock.json
++++ code-server/lib/vscode/package-lock.json
+@@ -72,6 +72,7 @@
+         "vscode-regexpp": "^3.1.0",
+         "vscode-textmate": "^9.3.2",
+         "ws": "^8.19.0",
++        "xterm-ko-ime-adapter": "file:../../../xterm-ko-ime-adapter",
+         "yauzl": "^3.3.1",
+         "yazl": "^2.4.3",
+         "zod": "^3.25.76"
+@@ -184,6 +185,16 @@
+         "windows-foreground-love": "0.6.1"
+       }
+     },
++    "../../../xterm-ko-ime-adapter": {
++      "version": "0.1.0",
++      "license": "MIT",
++      "devDependencies": {
++        "typescript": "^5.9.2"
++      },
++      "peerDependencies": {
++        "@xterm/xterm": ">=5"
++      }
++    },
+     "node_modules/@anthropic-ai/claude-agent-sdk": {
+       "version": "0.3.169",
+       "resolved": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/-/claude-agent-sdk-0.3.169.tgz",
+@@ -19979,6 +19990,10 @@
+         "node": ">=0.4"
+       }
+     },
++    "node_modules/xterm-ko-ime-adapter": {
++      "resolved": "../../../xterm-ko-ime-adapter",
++      "link": true
++    },
+     "node_modules/y18n": {
+       "version": "5.0.8",
+       "resolved": "https://registry.npmjs.org/y18n/-/y18n-5.0.8.tgz",
+Index: code-server/lib/vscode/package.json
+===================================================================
+--- code-server.orig/lib/vscode/package.json
++++ code-server/lib/vscode/package.json
+@@ -156,6 +156,7 @@
+     "vscode-regexpp": "^3.1.0",
+     "vscode-textmate": "^9.3.2",
+     "ws": "^8.19.0",
++    "xterm-ko-ime-adapter": "file:../../../xterm-ko-ime-adapter",
+     "yauzl": "^3.3.1",
+     "yazl": "^2.4.3",
+     "zod": "^3.25.76"
